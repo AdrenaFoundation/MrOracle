@@ -88,28 +88,24 @@ async fn main() -> Result<(), anyhow::Error> {
         .map_err(|e| anyhow::anyhow!("Failed to get program: {:?}", e))?;
 
     // ////////////////////////////////////////////////////////////////
-    // DB CONNECTION
+    // DB CONNECTION POOL
     // ////////////////////////////////////////////////////////////////
-    // Connect to the DB that contains the table matching the UserStaking accounts to their owners
-    let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
+    let mut ssl_builder = SslConnector::builder(SslMethod::tls()).unwrap();
+    ssl_builder.set_ca_file(&args.combined_cert).map_err(|e| {
+        log::error!("Failed to set CA file: {}", e);
+        anyhow::anyhow!("Failed to set CA file: {}", e)
+    })?;
+    let tls_connector = MakeTlsConnector::new(ssl_builder.build());
 
-    // Use the combined certificate
-    let _ = builder
-        .set_ca_file(&args.combined_cert)
-        .map_err(|e| anyhow::anyhow!("Failed to set CA file: {}", e));
-
-    let connector = MakeTlsConnector::new(builder.build());
-
-    let (db, db_connection) = tokio_postgres::connect(&args.db_string, connector)
-        .await
-        .map_err(|e| anyhow::anyhow!("PostgreSQL connection error: {:?}", e))?;
-
-    // Continous polling to keep connection alive in a separate thread
-    tokio::spawn(async move {
-        if let Err(e) = db_connection.await {
-            log::error!("PostgreSQL connection error: {}", e);
-        }
-    });
+    let db_config = args.db_string.parse::<tokio_postgres::Config>()?;
+    let mgr_config = deadpool_postgres::ManagerConfig {
+        recycling_method: deadpool_postgres::RecyclingMethod::Fast,
+    };
+    let mgr = deadpool_postgres::Manager::from_config(db_config, tls_connector, mgr_config);
+    let db_pool = deadpool_postgres::Pool::builder(mgr)
+        .max_size(1)
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to create DB pool: {:?}", e))?;
 
     // ////////////////////////////////////////////////////////////////
     // Side thread to fetch the median priority fee every 5 seconds
@@ -164,7 +160,7 @@ async fn main() -> Result<(), anyhow::Error> {
     // ////////////////////////////////////////////////////////////////
     loop {
         let start = Instant::now();
-        let assets_prices = db::get_assets_prices::get_assets_prices(&db).await;
+        let assets_prices = db::get_assets_prices::get_assets_prices(&db_pool).await;
         match assets_prices {
             Ok(Some(assets_prices)) => {
                 let last_trading_prices = format_chaos_labs_oracle_entry_to_params(&assets_prices);
@@ -184,19 +180,16 @@ async fn main() -> Result<(), anyhow::Error> {
                         log::error!("Error formatting assets prices: {:?}", e);
                     }
                 }
-
-                let elapsed = start.elapsed();
-
-                sleep(Duration::from_secs(3 - elapsed.as_secs()));
             }
             Ok(None) => {
-                log::info!("No assets prices found in DB - Sleeping 5 seconds");
-                sleep(Duration::from_millis(500));
+                log::warn!("No assets prices found in DB - Sleeping 500ms");
             }
             Err(e) => {
-                log::error!("Error getting assets prices: {:?}", e);
-                sleep(Duration::from_millis(500));
+                log::error!("Database query error: {:?} - Sleeping 500ms", e);
             }
         }
+
+        let elapsed = start.elapsed();
+        sleep(Duration::from_secs(3 - elapsed.as_secs()));
     }
 }

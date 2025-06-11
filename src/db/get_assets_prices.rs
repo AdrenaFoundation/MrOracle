@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use deadpool_postgres::Pool as DbPool;
 use rust_decimal::Decimal;
 
 pub struct AssetsPrices {
@@ -19,10 +20,13 @@ pub struct AssetsPrices {
     pub latest_timestamp: DateTime<Utc>,
 }
 
-pub async fn get_assets_prices(
-    db: &tokio_postgres::Client,
-) -> Result<Option<AssetsPrices>, anyhow::Error> {
-    let rows = db
+pub async fn get_assets_prices(db_pool: &DbPool) -> Result<Option<AssetsPrices>, anyhow::Error> {
+    let client = db_pool.get().await.map_err(|e| {
+        log::error!("Failed to get database connection: {:?}", e);
+        anyhow::anyhow!("Failed to get database connection: {:?}", e)
+    })?;
+
+    let rows = client
         .query(
             "SELECT
                 solusd_price,
