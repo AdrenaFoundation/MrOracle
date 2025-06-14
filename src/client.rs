@@ -20,7 +20,7 @@ use utils::format_chaos_labs_oracle_entry_to_params::format_chaos_labs_oracle_en
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:10000";
 const MEAN_PRIORITY_FEE_PERCENTILE: u64 = 2500; // 25th
 const PRIORITY_FEE_REFRESH_INTERVAL: Duration = Duration::from_secs(5); // seconds
-const UPDATE_AUM_CU_LIMIT: u32 = 90_000;
+const UPDATE_AUM_CU_LIMIT: u32 = 95_000;
 
 #[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
 enum ArgsCommitment {
