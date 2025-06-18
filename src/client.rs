@@ -97,13 +97,19 @@ async fn main() -> Result<(), anyhow::Error> {
     })?;
     let tls_connector = MakeTlsConnector::new(ssl_builder.build());
 
-    let db_config = args.db_string.parse::<tokio_postgres::Config>()?;
+    let mut db_config = args.db_string.parse::<tokio_postgres::Config>()?;
+
+    // Add connection timeout and keepalive settings
+    db_config.connect_timeout(Duration::from_secs(2)); // Fast timeout for 3s cycle, connection should be established in less than 2s
+    db_config.keepalives(true);
+    db_config.keepalives_idle(Duration::from_secs(6)); // Check connection health after 6s of inactivity, should not happen considering 3s cycles but it is better to be safe
+
     let mgr_config = deadpool_postgres::ManagerConfig {
         recycling_method: deadpool_postgres::RecyclingMethod::Fast,
     };
     let mgr = deadpool_postgres::Manager::from_config(db_config, tls_connector, mgr_config);
     let db_pool = deadpool_postgres::Pool::builder(mgr)
-        .max_size(1)
+        .max_size(1) // Single connection - only one query at a time
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to create DB pool: {:?}", e))?;
 
@@ -190,6 +196,9 @@ async fn main() -> Result<(), anyhow::Error> {
         }
 
         let elapsed = start.elapsed();
-        sleep(Duration::from_secs(3 - elapsed.as_secs()));
+        let sleep_duration = Duration::from_secs(3).saturating_sub(elapsed);
+        if sleep_duration > Duration::from_millis(0) {
+            sleep(sleep_duration);
+        }
     }
 }

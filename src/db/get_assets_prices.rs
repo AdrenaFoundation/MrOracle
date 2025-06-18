@@ -1,7 +1,10 @@
 use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool as DbPool;
 use rust_decimal::Decimal;
+use std::time::Duration;
+use tokio::time::sleep;
 
+#[derive(Debug, Clone)]
 pub struct AssetsPrices {
     pub solusd_price: Decimal,
     pub jitosolusd_price: Decimal,
@@ -21,6 +24,41 @@ pub struct AssetsPrices {
 }
 
 pub async fn get_assets_prices(db_pool: &DbPool) -> Result<Option<AssetsPrices>, anyhow::Error> {
+    get_assets_prices_with_retry(db_pool, 3).await
+}
+
+pub async fn get_assets_prices_with_retry(
+    db_pool: &DbPool,
+    max_retries: u32,
+) -> Result<Option<AssetsPrices>, anyhow::Error> {
+    let mut last_error = None;
+
+    for attempt in 1..=max_retries {
+        match try_get_assets_prices(db_pool).await {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                log::warn!(
+                    "Database query attempt {}/{} failed: {:?}",
+                    attempt,
+                    max_retries,
+                    e
+                );
+                last_error = Some(e);
+
+                if attempt < max_retries {
+                    // Fast exponential backoff: 50ms, 100ms, 200ms (max 2s total)
+                    let delay = Duration::from_millis(50 * (2_u64.pow(attempt - 1)));
+                    log::debug!("Retrying in {:?}...", delay);
+                    sleep(delay).await;
+                }
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Max retries exceeded")))
+}
+
+async fn try_get_assets_prices(db_pool: &DbPool) -> Result<Option<AssetsPrices>, anyhow::Error> {
     let client = db_pool.get().await.map_err(|e| {
         log::error!("Failed to get database connection: {:?}", e);
         anyhow::anyhow!("Failed to get database connection: {:?}", e)
