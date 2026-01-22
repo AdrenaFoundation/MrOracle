@@ -196,7 +196,7 @@ async fn main() -> Result<(), anyhow::Error> {
         }
 
         let elapsed = start.elapsed();
-        let sleep_duration = Duration::from_secs(3).saturating_sub(elapsed);
+        let sleep_duration = Duration::from_secs(1).saturating_sub(elapsed);
         if sleep_duration > Duration::from_millis(0) {
             sleep(sleep_duration);
         }
