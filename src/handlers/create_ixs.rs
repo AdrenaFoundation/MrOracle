@@ -1,30 +1,36 @@
 use {
-    adrena_abi::{oracle::ChaosLabsBatchPrices, ALP_MINT, CORTEX_ID, MAIN_POOL_ID},
-    solana_sdk::pubkey::Pubkey,
+    crate::adrena_ix::{self, MultiBatchPrices, SwitchboardFeedMapEntry},
+    adrena_abi::oracle::ChaosLabsBatchPrices,
+    solana_sdk::{
+        instruction::{AccountMeta, Instruction},
+        pubkey::Pubkey,
+    },
 };
 
 pub fn create_update_pool_aum_ix(
     payer: &Pubkey,
     last_trading_prices: Option<ChaosLabsBatchPrices>,
-) -> (
-    adrena_abi::instruction::UpdatePoolAum,
-    adrena_abi::accounts::UpdatePoolAum,
-) {
-    let oracle_pda = adrena_abi::pda::get_oracle_pda().0;
+    custody_accounts: &[AccountMeta],
+) -> Result<Instruction, anyhow::Error> {
+    adrena_ix::build_update_pool_aum_ix(payer, last_trading_prices, custody_accounts)
+}
 
-    let args = adrena_abi::instruction::UpdatePoolAum {
-        params: adrena_abi::types::UpdatePoolAumParams {
-            oracle_prices: last_trading_prices,
-        },
-    };
+pub fn create_update_oracle_switchboard_ix(
+    quote_accounts: &[Pubkey],
+    quote_instruction_indices: Vec<u8>,
+    max_age_slots: u64,
+    feed_map: Vec<SwitchboardFeedMapEntry>,
+) -> Result<Instruction, anyhow::Error> {
+    adrena_ix::build_update_oracle_switchboard_ix(
+        quote_accounts,
+        quote_instruction_indices,
+        max_age_slots,
+        feed_map,
+    )
+}
 
-    let accounts = adrena_abi::accounts::UpdatePoolAum {
-        payer: *payer,
-        cortex: CORTEX_ID,
-        pool: MAIN_POOL_ID,
-        oracle: oracle_pda,
-        lp_token_mint: ALP_MINT,
-    };
-
-    (args, accounts)
+pub fn create_update_oracle_multi_ix(
+    multi_oracle_prices: MultiBatchPrices,
+) -> Result<Instruction, anyhow::Error> {
+    adrena_ix::build_update_oracle_multi_ix(multi_oracle_prices)
 }

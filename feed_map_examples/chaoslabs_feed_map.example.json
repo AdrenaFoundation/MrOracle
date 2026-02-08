@@ -1,0 +1,46 @@
+{
+  "schema_version": "v1",
+  "chaoslabs_feed_map": [
+    {
+      "adrena_feed_id": 1,
+      "symbol": "JITOSOL/USD",
+      "source_price_field": "jitosolusd_price",
+      "source_timestamp_field": "jitosolusd_price_ts"
+    },
+    {
+      "adrena_feed_id": 0,
+      "symbol": "SOL/USD",
+      "source_price_field": "solusd_price",
+      "source_timestamp_field": "solusd_price_ts"
+    },
+    {
+      "adrena_feed_id": 3,
+      "symbol": "WBTC/USD",
+      "source_price_field": "wbtcusd_price",
+      "source_timestamp_field": "wbtcusd_price_ts"
+    },
+    {
+      "adrena_feed_id": 2,
+      "symbol": "BTC/USD",
+      "source_price_field": "btcusd_price",
+      "source_timestamp_field": "btcusd_price_ts"
+    },
+    {
+      "adrena_feed_id": 4,
+      "symbol": "BONK/USD",
+      "source_price_field": "bonkusd_price",
+      "source_timestamp_field": "bonkusd_price_ts"
+    },
+    {
+      "adrena_feed_id": 5,
+      "symbol": "USDC/USD",
+      "source_price_field": "usdcusd_price",
+      "source_timestamp_field": "usdcusd_price_ts"
+    }
+  ],
+  "notes": {
+    "signature_field": "signature",
+    "recovery_id_field": "recovery_id",
+    "source": "assets_price row from ChaosLabs ingestion"
+  }
+}

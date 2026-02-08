@@ -1,0 +1,37 @@
+{
+  "schema_version": "v1",
+  "autonom_feed_map": [
+    {
+      "adrena_feed_id": 30,
+      "autonom_feed_id": 1030
+    },
+    {
+      "adrena_feed_id": 31,
+      "autonom_feed_id": 1040
+    },
+    {
+      "adrena_feed_id": 32,
+      "autonom_feed_id": 1029
+    },
+    {
+      "adrena_feed_id": 33,
+      "autonom_feed_id": 1002
+    },
+    {
+      "adrena_feed_id": 34,
+      "autonom_feed_id": 1038
+    },
+    {
+      "adrena_feed_id": 35,
+      "autonom_feed_id": 1021
+    },
+    {
+      "adrena_feed_id": 36,
+      "autonom_feed_id": 1022
+    },
+    {
+      "adrena_feed_id": 37,
+      "autonom_feed_id": 4001
+    }
+  ]
+}

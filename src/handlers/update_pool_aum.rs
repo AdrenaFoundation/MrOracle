@@ -14,15 +14,18 @@ pub async fn update_pool_aum(
     program: &Program<Arc<Keypair>>,
     median_priority_fee: u64,
     last_trading_prices: ChaosLabsBatchPrices,
-    remaining_accounts: Vec<AccountMeta>,
+    custody_accounts: Vec<AccountMeta>,
 ) -> Result<(), anyhow::Error> {
     log::info!("  <*> Updating AUM");
 
-    let (update_pool_aum_params, update_pool_aum_accounts) =
-        create_update_pool_aum_ix(&program.payer(), Some(last_trading_prices));
+    let update_pool_aum_ix = create_update_pool_aum_ix(
+        &program.payer(),
+        Some(last_trading_prices),
+        &custody_accounts,
+    )?;
 
     let tx = timeout(
-        Duration::from_secs(2), // 2 second timeout for handling getBlockHash hanging
+        Duration::from_secs(2),
         program
             .request()
             .instruction(ComputeBudgetInstruction::set_compute_unit_price(
@@ -31,15 +34,12 @@ pub async fn update_pool_aum(
             .instruction(ComputeBudgetInstruction::set_compute_unit_limit(
                 UPDATE_AUM_CU_LIMIT,
             ))
-            .args(update_pool_aum_params)
-            .accounts(update_pool_aum_accounts)
-            // Remaining accounts
-            .accounts(remaining_accounts)
+            .instruction(update_pool_aum_ix)
             .signed_transaction(),
     )
     .await
     .map_err(|_| {
-        log::error!("   <> Transaction generation timed out after 10 seconds");
+        log::error!("   <> Transaction generation timed out after 2 seconds");
         anyhow::anyhow!("Transaction generation timed out")
     })?
     .map_err(|e| {
