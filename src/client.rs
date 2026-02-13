@@ -19,7 +19,8 @@ pub mod switchboard;
 pub mod utils;
 
 use utils::format_chaos_labs_oracle_entry_to_params::{
-    format_chaos_labs_oracle_entry_to_params, load_chaos_labs_feed_map,
+    format_chaos_labs_oracle_batch_to_params, format_chaos_labs_oracle_entry_to_params,
+    load_chaos_labs_feed_map,
 };
 
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:10000";
@@ -36,7 +37,6 @@ const DEFAULT_SWITCHBOARD_DEVNET_QUEUE_PUBKEY: &str =
     "EYiAmGSdsQTuCw413V5BzaruWuCCSDgTPtBGvLkXHbe7";
 const DEFAULT_SWITCHBOARD_CYCLE_MS: u64 = 5_000;
 const DEFAULT_SWITCHBOARD_MAX_AGE_SLOTS: u64 = 32;
-const DEFAULT_AUTONOM_API_URL: &str = "http://178.128.21.71:3000";
 const DEFAULT_AUTONOM_POLL_MS: u64 = 3_000;
 
 #[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
@@ -137,20 +137,20 @@ struct Args {
     #[clap(long, default_value_t = UPDATE_ORACLE_CU_LIMIT)]
     update_oracle_cu_limit: u32,
 
-    /// Autonom API base URL
-    #[clap(long, default_value_t = String::from(DEFAULT_AUTONOM_API_URL))]
-    autonom_api_url: String,
+    /// Deprecated (ignored): Autonom API base URL
+    #[clap(long, hide = true)]
+    autonom_api_url: Option<String>,
 
-    /// Autonom API key (if omitted, reads AUTONOM_API_KEY env var, then defaults to readkey1)
-    #[clap(long)]
+    /// Deprecated (ignored): Autonom API key
+    #[clap(long, hide = true)]
     autonom_api_key: Option<String>,
 
     /// Path to autonom feed mapping json
     #[clap(long)]
     autonom_feed_map_path: Option<String>,
 
-    /// Request fresh prices from autonom (if false, allows last-known values)
-    #[clap(long, default_value_t = false)]
+    /// Deprecated (ignored): request fresh prices from autonom
+    #[clap(long, default_value_t = false, hide = true)]
     autonom_fresh: bool,
 
     /// Autonom polling interval in milliseconds
@@ -219,15 +219,17 @@ async fn main() -> Result<(), anyhow::Error> {
         .program(adrena_abi::ID)
         .map_err(|e| anyhow::anyhow!("Failed to get program: {:?}", e))?;
 
-    let db_pool = if run_chaoslabs {
-        let combined_cert = args
-            .combined_cert
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("chaoslabs mode requires --combined-cert"))?;
-        let db_string = args
-            .db_string
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("chaoslabs mode requires --db-string"))?;
+    let db_pool = if run_chaoslabs || run_autonom {
+        let combined_cert = args.combined_cert.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "chaoslabs/autonom mode requires --combined-cert (DB-backed provider ingestion)"
+            )
+        })?;
+        let db_string = args.db_string.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "chaoslabs/autonom mode requires --db-string (DB-backed provider ingestion)"
+            )
+        })?;
 
         // ////////////////////////////////////////////////////////////////
         // DB CONNECTION POOL
@@ -417,16 +419,14 @@ async fn main() -> Result<(), anyhow::Error> {
 
     if run_autonom {
         let autonom_startup_result: Result<(), anyhow::Error> = (|| {
-            let autonom_api_key = args
-            .autonom_api_key
-            .clone()
-            .or_else(|| env::var("AUTONOM_API_KEY").ok())
-            .unwrap_or_else(|| {
+            if args.autonom_api_url.is_some()
+                || args.autonom_api_key.is_some()
+                || args.autonom_fresh
+            {
                 log::warn!(
-                    "autonom is enabled without --autonom-api-key/AUTONOM_API_KEY; defaulting to readkey1"
+                    "autonom API flags are deprecated and ignored; keeper now reads provider='autonom' batches from DB"
                 );
-                "readkey1".to_string()
-            });
+            }
 
             let autonom_feed_map_path = args
                 .autonom_feed_map_path
@@ -438,11 +438,15 @@ async fn main() -> Result<(), anyhow::Error> {
                     )
                 })?;
 
+            let autonom_db_pool = db_pool.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "autonom is enabled but DB pool is not initialized; pass --db-string and --combined-cert"
+                )
+            })?;
+
             let autonom_cfg = autonom::AutonomRuntimeConfig {
-                api_url: args.autonom_api_url.clone(),
-                api_key: autonom_api_key,
+                db_pool: autonom_db_pool,
                 feed_map_path: autonom_feed_map_path,
-                fresh: args.autonom_fresh,
                 poll_interval: Duration::from_millis(args.autonom_poll_ms),
                 update_oracle_cu_limit: args.update_oracle_cu_limit,
             };
@@ -482,35 +486,68 @@ async fn main() -> Result<(), anyhow::Error> {
 
         loop {
             let start = Instant::now();
-            let assets_prices = db::get_assets_prices::get_assets_prices(&db_pool).await;
-            match assets_prices {
-                Ok(Some(assets_prices)) => {
-                    let last_trading_prices = format_chaos_labs_oracle_entry_to_params(
-                        &assets_prices,
-                        &chaoslabs_feed_bindings,
+            let last_trading_prices = match db::get_latest_oracle_batch_by_provider(
+                &db_pool,
+                "chaoslabs",
+            )
+            .await
+            {
+                Ok(Some(chaoslabs_batch)) => format_chaos_labs_oracle_batch_to_params(
+                    &chaoslabs_batch,
+                    &chaoslabs_feed_bindings,
+                ),
+                Ok(None) => {
+                    log::warn!(
+                        "No chaoslabs batch found in oracle_batches, falling back to legacy assets_price"
                     );
-
-                    match last_trading_prices {
-                        Ok(last_trading_prices) => {
-                            // ignore errors on call since we want to keep executing IX
-                            let _ = handlers::update_pool_aum(
-                                &program,
-                                *median_priority_fee.lock().await,
-                                last_trading_prices,
-                                custody_accounts.clone(),
-                            )
-                            .await;
-                        }
-                        Err(e) => {
-                            log::error!("Error formatting assets prices: {:?}", e);
-                        }
+                    match db::get_assets_prices::get_assets_prices(&db_pool).await {
+                        Ok(Some(assets_prices)) => format_chaos_labs_oracle_entry_to_params(
+                            &assets_prices,
+                            &chaoslabs_feed_bindings,
+                        ),
+                        Ok(None) => Err(anyhow::anyhow!(
+                            "No chaoslabs price entry found in oracle_batches or legacy assets_price"
+                        )),
+                        Err(e) => Err(anyhow::anyhow!(
+                            "Legacy assets_price fallback query failed: {:?}",
+                            e
+                        )),
                     }
                 }
-                Ok(None) => {
-                    log::warn!("No assets prices found in DB - Sleeping 500ms");
+                Err(e) => {
+                    log::warn!(
+                        "Failed querying oracle_batches for chaoslabs ({:?}); trying legacy assets_price fallback",
+                        e
+                    );
+                    match db::get_assets_prices::get_assets_prices(&db_pool).await {
+                        Ok(Some(assets_prices)) => format_chaos_labs_oracle_entry_to_params(
+                            &assets_prices,
+                            &chaoslabs_feed_bindings,
+                        ),
+                        Ok(None) => Err(anyhow::anyhow!(
+                            "No chaoslabs price entry found in legacy assets_price fallback"
+                        )),
+                        Err(legacy_e) => Err(anyhow::anyhow!(
+                            "Legacy assets_price fallback query failed: {:?}",
+                            legacy_e
+                        )),
+                    }
+                }
+            };
+
+            match last_trading_prices {
+                Ok(last_trading_prices) => {
+                    // ignore errors on call since we want to keep executing IX
+                    let _ = handlers::update_pool_aum(
+                        &program,
+                        *median_priority_fee.lock().await,
+                        last_trading_prices,
+                        custody_accounts.clone(),
+                    )
+                    .await;
                 }
                 Err(e) => {
-                    log::error!("Database query error: {:?} - Sleeping 500ms", e);
+                    log::error!("Error building chaoslabs payload from DB: {:?}", e);
                 }
             }
 

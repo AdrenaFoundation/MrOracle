@@ -1,10 +1,13 @@
 use {
-    crate::db::get_assets_prices::AssetsPrices,
+    crate::db::{get_assets_prices::AssetsPrices, OracleBatch},
     adrena_abi::oracle::{ChaosLabsBatchPrices, PriceData},
     anyhow::Context,
     rust_decimal::prelude::ToPrimitive,
     serde::Deserialize,
-    std::{collections::HashSet, fs},
+    std::{
+        collections::{HashMap, HashSet},
+        fs,
+    },
 };
 
 const CHAOSLABS_MIN_FEED_ID: u8 = 0;
@@ -193,6 +196,101 @@ pub fn format_chaos_labs_oracle_entry_to_params(
             feed_id: binding.adrena_feed_id,
             price: binding.price_field.read(chaos_labs_oracle_entry)?,
             timestamp: binding.timestamp_field.read(chaos_labs_oracle_entry),
+        });
+    }
+
+    Ok(ChaosLabsBatchPrices {
+        prices,
+        signature: signature_vec,
+        recovery_id,
+    })
+}
+
+pub fn format_chaos_labs_oracle_batch_to_params(
+    oracle_batch: &OracleBatch,
+    feed_bindings: &[ChaosLabsFeedBinding],
+) -> Result<ChaosLabsBatchPrices, anyhow::Error> {
+    if feed_bindings.is_empty() {
+        return Err(anyhow::anyhow!("chaoslabs feed mapping is empty"));
+    }
+
+    if oracle_batch.provider != "chaoslabs" {
+        return Err(anyhow::anyhow!(
+            "expected chaoslabs provider batch, got `{}`",
+            oracle_batch.provider
+        ));
+    }
+
+    let signature_hex = oracle_batch
+        .signature
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("chaoslabs DB batch has no signature"))?
+        .trim_start_matches("0x");
+    let signature_bytes =
+        hex::decode(signature_hex).context("failed to decode chaoslabs signature hex")?;
+    let signature_vec: [u8; 64] = signature_bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("chaoslabs signature must be 64 bytes"))?;
+
+    let recovery_id = oracle_batch
+        .recovery_id
+        .ok_or_else(|| anyhow::anyhow!("chaoslabs DB batch has no recovery_id"))
+        .and_then(|id| {
+            u8::try_from(id).map_err(|_| anyhow::anyhow!("invalid chaoslabs recovery_id {}", id))
+        })?;
+
+    let mut prices_by_feed_id = HashMap::<u8, &crate::db::OracleBatchPrice>::new();
+    for price_row in &oracle_batch.prices {
+        let feed_id = u8::try_from(price_row.feed_id).map_err(|_| {
+            anyhow::anyhow!(
+                "invalid chaoslabs batch feed_id {}; expected u8",
+                price_row.feed_id
+            )
+        })?;
+
+        if prices_by_feed_id.contains_key(&feed_id) {
+            return Err(anyhow::anyhow!(
+                "duplicate chaoslabs batch feed_id {} in batch {}",
+                feed_id,
+                oracle_batch.oracle_batch_id
+            ));
+        }
+
+        prices_by_feed_id.insert(feed_id, price_row);
+    }
+
+    let mut prices = Vec::with_capacity(feed_bindings.len());
+    for binding in feed_bindings {
+        let batch_price_row = prices_by_feed_id
+            .get(&binding.adrena_feed_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "missing chaoslabs price for feed_id {} in batch {}",
+                    binding.adrena_feed_id,
+                    oracle_batch.oracle_batch_id
+                )
+            })?;
+
+        if batch_price_row.exponent != -10 {
+            return Err(anyhow::anyhow!(
+                "unsupported chaoslabs exponent {} for feed_id {}",
+                batch_price_row.exponent,
+                binding.adrena_feed_id
+            ));
+        }
+
+        let normalized_price = batch_price_row.price.to_u64().ok_or_else(|| {
+            anyhow::anyhow!(
+                "failed to convert chaoslabs price {} to u64 for feed_id {}",
+                batch_price_row.price,
+                binding.adrena_feed_id
+            )
+        })?;
+
+        prices.push(PriceData {
+            feed_id: binding.adrena_feed_id,
+            price: normalized_price,
+            timestamp: batch_price_row.price_timestamp.timestamp(),
         });
     }
 

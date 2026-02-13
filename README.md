@@ -52,15 +52,14 @@ Feed map format example is in `feed_map_examples/switchboard_feed_map.example.js
 
 ## Autonom Runtime (Signed Batch Flow)
 
+Autonom in keeper is DB-backed and consumes batches already ingested in `adrena-data` (`oracle_batches` + `oracle_batch_prices`).
+
 Autonom uses:
 
 - `--autonom-feed-map-path <path>` or `AUTONOM_FEED_MAP_PATH`
 
 Optional overrides:
 
-- `--autonom-api-url` (default `http://178.128.21.71:3000`)
-- `--autonom-api-key` (or `AUTONOM_API_KEY`; falls back to `readkey1` if omitted)
-- `--autonom-fresh` (default `false`)
 - `--autonom-poll-ms` (default `3000`)
 - `--update-oracle-cu-limit` (shared with switchboard/autonom update_oracle txs)
 
@@ -82,8 +81,12 @@ For reference and keeper-side consistency, an example mapping file is provided a
 Important: ChaosLabs signature verification is order-sensitive. Keep `chaoslabs_feed_map` entries
 in the same signed order expected by your upstream signer.
 
+ChaosLabs keeper consumption is DB-backed and prefers `oracle_batches` (`provider='chaoslabs'`).
+It falls back to legacy `assets_price` if the new tables are unavailable.
+
 ## Provider Startup Behavior
 
 - In default mode, all 3 providers are attempted.
 - Missing required config for any selected provider is a startup error (hard fail).
-- `--db-string`, `--combined-cert`, and ChaosLabs feed map config are required only when ChaosLabs is active.
+- `--db-string` and `--combined-cert` are required when ChaosLabs or Autonom is active.
+- ChaosLabs feed map config is required only when ChaosLabs is active.

@@ -1,8 +1,10 @@
 use {
-    crate::{adrena_ix::ORACLE_PROVIDER_AUTONOM, handlers},
+    crate::{adrena_ix::ORACLE_PROVIDER_AUTONOM, db::OracleBatch, handlers},
     adrena_abi::oracle::{ChaosLabsBatchPrices, PriceData},
     anchor_client::Program,
     anyhow::Context,
+    deadpool_postgres::Pool as DbPool,
+    rust_decimal::prelude::ToPrimitive,
     serde::Deserialize,
     solana_sdk::signature::Keypair,
     std::{
@@ -14,6 +16,7 @@ use {
     tokio::sync::Mutex,
 };
 
+const AUTONOM_PROVIDER: &str = "autonom";
 const AUTONOM_MIN_FEED_ID: u8 = 30;
 const AUTONOM_MAX_FEED_ID: u8 = 141;
 
@@ -23,21 +26,16 @@ const ADRENA_ORACLE_PRICE_SLOT_LEN: usize = 64;
 const ADRENA_ORACLE_PRICE_FEED_ID_OFFSET: usize = 28;
 const ADRENA_ORACLE_PRICE_NAME_LEN_OFFSET: usize = 63;
 
-const YEAR_2100_SECONDS: i64 = 4_102_444_800;
-
 #[derive(Debug, Clone)]
 pub struct AutonomRuntimeConfig {
-    pub api_url: String,
-    pub api_key: String,
+    pub db_pool: DbPool,
     pub feed_map_path: String,
-    pub fresh: bool,
     pub poll_interval: Duration,
     pub update_oracle_cu_limit: u32,
 }
 
 #[derive(Debug, Clone)]
 struct AutonomAliasMapping {
-    canonical_by_alias: HashMap<u8, u64>,
     alias_by_canonical: HashMap<u64, u8>,
 }
 
@@ -55,30 +53,6 @@ enum AutonomFeedMapFile {
         _schema_version: Option<String>,
         autonom_feed_map: Vec<AutonomFeedMapEntryRaw>,
     },
-}
-
-#[derive(Debug, Deserialize)]
-struct AutonomBatchResponse {
-    prices: Vec<AutonomPrice>,
-    #[serde(default)]
-    errors: Vec<AutonomError>,
-    signature: String,
-    recovery_id: u8,
-}
-
-#[derive(Debug, Deserialize)]
-struct AutonomPrice {
-    feed_id: u64,
-    price: u64,
-    expo: i32,
-    timestamp: i64,
-}
-
-#[derive(Debug, Deserialize)]
-struct AutonomError {
-    feed_id: u64,
-    code: String,
-    message: String,
 }
 
 pub async fn run_autonom_keeper(
@@ -111,11 +85,16 @@ async fn run_autonom_cycle(
         return Ok(());
     }
 
-    let canonical_feed_ids =
-        resolve_required_canonical_feed_ids(&required_alias_feed_ids, alias_mapping)?;
+    let db_batch = match fetch_latest_autonom_batch_from_db(&config.db_pool).await? {
+        Some(batch) => batch,
+        None => {
+            log::warn!("No autonom batch found in DB; skipping cycle");
+            return Ok(());
+        }
+    };
 
-    let response = fetch_autonom_batch_response(config, &canonical_feed_ids).await?;
-    let batch = build_autonom_batch_prices(response, &required_alias_feed_ids, alias_mapping)?;
+    let batch =
+        build_autonom_batch_prices_from_db(db_batch, &required_alias_feed_ids, alias_mapping)?;
 
     let median_priority_fee = *median_priority_fee.lock().await;
 
@@ -142,6 +121,12 @@ async fn fetch_required_autonom_alias_feed_ids(
         .with_context(|| format!("failed to fetch oracle account data at {oracle_pda}"))?;
 
     Ok(parse_registered_autonom_feed_ids(&account_data))
+}
+
+async fn fetch_latest_autonom_batch_from_db(
+    db_pool: &DbPool,
+) -> Result<Option<OracleBatch>, anyhow::Error> {
+    crate::db::get_latest_oracle_batch_by_provider(db_pool, AUTONOM_PROVIDER).await
 }
 
 fn parse_registered_autonom_feed_ids(account_data: &[u8]) -> Vec<u8> {
@@ -171,113 +156,57 @@ fn parse_registered_autonom_feed_ids(account_data: &[u8]) -> Vec<u8> {
     out
 }
 
-fn resolve_required_canonical_feed_ids(
-    required_alias_feed_ids: &[u8],
-    alias_mapping: &AutonomAliasMapping,
-) -> Result<Vec<u64>, anyhow::Error> {
-    let mut canonical_ids = Vec::with_capacity(required_alias_feed_ids.len());
-
-    for alias_feed_id in required_alias_feed_ids {
-        let canonical = alias_mapping
-            .canonical_by_alias
-            .get(alias_feed_id)
-            .copied()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "missing alias mapping for required autonom feed_id {}",
-                    alias_feed_id
-                )
-            })?;
-
-        canonical_ids.push(canonical);
-    }
-
-    canonical_ids.sort_unstable();
-    Ok(canonical_ids)
-}
-
-async fn fetch_autonom_batch_response(
-    config: &AutonomRuntimeConfig,
-    canonical_feed_ids: &[u64],
-) -> Result<AutonomBatchResponse, anyhow::Error> {
-    let endpoint = format!("{}/prices/batch", config.api_url.trim_end_matches('/'));
-    let feed_ids_csv = canonical_feed_ids
-        .iter()
-        .map(|id| id.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-
-    let fresh_param = if config.fresh { "true" } else { "false" }.to_string();
-    let api_key = config.api_key.clone();
-
-    tokio::task::spawn_blocking(move || -> Result<AutonomBatchResponse, anyhow::Error> {
-        let response = match ureq::get(&endpoint)
-            .query("feed_ids", &feed_ids_csv)
-            .query("fresh", &fresh_param)
-            .set("X-API-Key", &api_key)
-            .call()
-        {
-            Ok(response) => response,
-            Err(ureq::Error::Status(status, response)) => {
-                let body = response.into_string().unwrap_or_default();
-                return Err(anyhow::anyhow!(
-                    "autonom batch request returned status {} with body: {}",
-                    status,
-                    body
-                ));
-            }
-            Err(err) => {
-                return Err(anyhow::anyhow!(
-                    "failed to send autonom batch request: {}",
-                    err
-                ));
-            }
-        };
-
-        let body = response
-            .into_string()
-            .context("failed to read autonom batch response body")?;
-        serde_json::from_str::<AutonomBatchResponse>(&body)
-            .context("failed to parse autonom batch response json")
-    })
-    .await
-    .context("autonom batch request task failed")?
-}
-
-fn build_autonom_batch_prices(
-    response: AutonomBatchResponse,
+fn build_autonom_batch_prices_from_db(
+    db_batch: OracleBatch,
     required_alias_feed_ids: &[u8],
     alias_mapping: &AutonomAliasMapping,
 ) -> Result<ChaosLabsBatchPrices, anyhow::Error> {
+    if db_batch.provider != AUTONOM_PROVIDER {
+        return Err(anyhow::anyhow!(
+            "received non-autonom batch from DB provider={} batch_id={}",
+            db_batch.provider,
+            db_batch.oracle_batch_id
+        ));
+    }
+
     let mut entries_by_alias = HashMap::<u8, PriceData>::new();
 
-    for price in response.prices {
-        if price.expo != -10 {
+    for price in db_batch.prices {
+        if price.exponent != -10 {
             return Err(anyhow::anyhow!(
-                "unsupported autonom expo {} for canonical feed_id {}",
-                price.expo,
-                price.feed_id
+                "unsupported autonom exponent {} for feed_id {} in batch_id {}",
+                price.exponent,
+                price.feed_id,
+                db_batch.oracle_batch_id
             ));
         }
 
-        let Some(alias_feed_id) = alias_mapping
-            .alias_by_canonical
-            .get(&price.feed_id)
-            .copied()
-        else {
+        let Some(alias_feed_id) = resolve_alias_feed_id(
+            price.feed_id,
+            price.source_feed_id.as_deref(),
+            alias_mapping,
+        ) else {
             log::warn!(
-                "Skipping autonom price for canonical feed_id {} (no alias mapping)",
-                price.feed_id
+                "Skipping autonom DB price feed_id={} source_feed_id={:?} symbol={:?} (no alias mapping)",
+                price.feed_id,
+                price.source_feed_id,
+                price.symbol
             );
             continue;
         };
 
-        let normalized_timestamp = normalize_timestamp_to_seconds(price.timestamp);
+        let price_value = price.price.to_u64().ok_or_else(|| {
+            anyhow::anyhow!(
+                "failed to convert autonom price {} to u64 for alias feed_id {}",
+                price.price,
+                alias_feed_id
+            )
+        })?;
 
         let new_price = PriceData {
             feed_id: alias_feed_id,
-            price: price.price,
-            timestamp: normalized_timestamp,
+            price: price_value,
+            timestamp: price.price_timestamp.timestamp(),
         };
 
         match entries_by_alias.get_mut(&alias_feed_id) {
@@ -298,26 +227,40 @@ fn build_autonom_batch_prices(
     let mut missing: Vec<u8> = required.difference(&provided).copied().collect();
     missing.sort_unstable();
     if !missing.is_empty() {
-        let error_summary = response
-            .errors
-            .iter()
-            .map(|err| format!("{}:{}:{}", err.feed_id, err.code, err.message))
-            .collect::<Vec<_>>()
-            .join(" | ");
-
         return Err(anyhow::anyhow!(
-            "autonom batch missing required alias feed_ids {:?}; provider errors: [{}]",
-            missing,
-            error_summary
+            "autonom DB batch {} missing required alias feed_ids {:?}",
+            db_batch.oracle_batch_id,
+            missing
         ));
     }
 
-    let signature_hex = response.signature.trim_start_matches("0x");
+    let signature_hex = db_batch
+        .signature
+        .as_deref()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "autonom DB batch {} has no signature",
+                db_batch.oracle_batch_id
+            )
+        })?
+        .trim_start_matches("0x");
     let signature_bytes =
         hex::decode(signature_hex).context("failed to decode autonom signature hex")?;
     let signature: [u8; 64] = signature_bytes
         .try_into()
         .map_err(|_| anyhow::anyhow!("autonom signature must be 64 bytes"))?;
+
+    let recovery_id = db_batch
+        .recovery_id
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "autonom DB batch {} has no recovery_id",
+                db_batch.oracle_batch_id
+            )
+        })
+        .and_then(|id| {
+            u8::try_from(id).map_err(|_| anyhow::anyhow!("invalid autonom recovery_id {}", id))
+        })?;
 
     let mut prices: Vec<PriceData> = entries_by_alias.into_values().collect();
     prices.sort_by_key(|price| price.feed_id);
@@ -325,8 +268,37 @@ fn build_autonom_batch_prices(
     Ok(ChaosLabsBatchPrices {
         prices,
         signature,
-        recovery_id: response.recovery_id,
+        recovery_id,
     })
+}
+
+fn resolve_alias_feed_id(
+    feed_id: i32,
+    source_feed_id: Option<&str>,
+    alias_mapping: &AutonomAliasMapping,
+) -> Option<u8> {
+    if let Ok(alias_feed_id) = u8::try_from(feed_id) {
+        if (AUTONOM_MIN_FEED_ID..=AUTONOM_MAX_FEED_ID).contains(&alias_feed_id) {
+            return Some(alias_feed_id);
+        }
+    }
+
+    if feed_id >= 0 {
+        let canonical = feed_id as u64;
+        if let Some(alias_feed_id) = alias_mapping.alias_by_canonical.get(&canonical).copied() {
+            return Some(alias_feed_id);
+        }
+    }
+
+    if let Some(raw_source_feed_id) = source_feed_id {
+        if let Ok(canonical) = raw_source_feed_id.parse::<u64>() {
+            if let Some(alias_feed_id) = alias_mapping.alias_by_canonical.get(&canonical).copied() {
+                return Some(alias_feed_id);
+            }
+        }
+    }
+
+    None
 }
 
 fn load_feed_map(feed_map_path: &str) -> Result<AutonomAliasMapping, anyhow::Error> {
@@ -356,7 +328,6 @@ fn load_feed_map(feed_map_path: &str) -> Result<AutonomAliasMapping, anyhow::Err
         ));
     }
 
-    let mut canonical_by_alias = HashMap::new();
     let mut alias_by_canonical = HashMap::new();
     let mut seen_adrena_feed_ids = HashSet::new();
     let mut seen_autonom_feed_ids = HashSet::new();
@@ -385,20 +356,8 @@ fn load_feed_map(feed_map_path: &str) -> Result<AutonomAliasMapping, anyhow::Err
             ));
         }
 
-        canonical_by_alias.insert(adrena_feed_id, autonom_feed_id);
         alias_by_canonical.insert(autonom_feed_id, adrena_feed_id);
     }
 
-    Ok(AutonomAliasMapping {
-        canonical_by_alias,
-        alias_by_canonical,
-    })
-}
-
-fn normalize_timestamp_to_seconds(raw_timestamp: i64) -> i64 {
-    let mut normalized = raw_timestamp;
-    while normalized > YEAR_2100_SECONDS {
-        normalized /= 1000;
-    }
-    normalized
+    Ok(AutonomAliasMapping { alias_by_canonical })
 }
