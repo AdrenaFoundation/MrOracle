@@ -1,5 +1,5 @@
 use {
-    crate::{adrena_ix::ORACLE_PROVIDER_AUTONOM, db::OracleBatch, handlers},
+    crate::{db::OracleBatch, provider_updates::ProviderUpdate},
     adrena_abi::oracle::{ChaosLabsBatchPrices, PriceData},
     anchor_client::Program,
     anyhow::Context,
@@ -13,7 +13,7 @@ use {
         sync::Arc,
         time::Duration,
     },
-    tokio::sync::Mutex,
+    tokio::sync::mpsc,
 };
 
 const AUTONOM_PROVIDER: &str = "autonom";
@@ -31,7 +31,6 @@ pub struct AutonomRuntimeConfig {
     pub db_pool: DbPool,
     pub feed_map_path: String,
     pub poll_interval: Duration,
-    pub update_oracle_cu_limit: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -57,14 +56,13 @@ enum AutonomFeedMapFile {
 
 pub async fn run_autonom_keeper(
     program: Program<Arc<Keypair>>,
-    median_priority_fee: Arc<Mutex<u64>>,
     config: AutonomRuntimeConfig,
+    update_sender: mpsc::Sender<ProviderUpdate>,
 ) -> Result<(), anyhow::Error> {
     let alias_mapping = load_feed_map(&config.feed_map_path)?;
 
     loop {
-        if let Err(err) =
-            run_autonom_cycle(&program, &median_priority_fee, &config, &alias_mapping).await
+        if let Err(err) = run_autonom_cycle(&program, &config, &alias_mapping, &update_sender).await
         {
             log::error!("Autonom cycle failed: {:?}", err);
         }
@@ -75,9 +73,9 @@ pub async fn run_autonom_keeper(
 
 async fn run_autonom_cycle(
     program: &Program<Arc<Keypair>>,
-    median_priority_fee: &Arc<Mutex<u64>>,
     config: &AutonomRuntimeConfig,
     alias_mapping: &AutonomAliasMapping,
+    update_sender: &mpsc::Sender<ProviderUpdate>,
 ) -> Result<(), anyhow::Error> {
     let required_alias_feed_ids = fetch_required_autonom_alias_feed_ids(program).await?;
     if required_alias_feed_ids.is_empty() {
@@ -96,16 +94,10 @@ async fn run_autonom_cycle(
     let batch =
         build_autonom_batch_prices_from_db(db_batch, &required_alias_feed_ids, alias_mapping)?;
 
-    let median_priority_fee = *median_priority_fee.lock().await;
-
-    handlers::update_oracle_with_multi_batch(
-        program,
-        median_priority_fee,
-        config.update_oracle_cu_limit,
-        ORACLE_PROVIDER_AUTONOM,
-        batch,
-    )
-    .await?;
+    update_sender
+        .send(ProviderUpdate::Autonom(batch))
+        .await
+        .map_err(|_| anyhow::anyhow!("autonom provider update channel closed"))?;
 
     Ok(())
 }

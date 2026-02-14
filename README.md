@@ -19,17 +19,140 @@ Ideally run that on a Render instance.
 
 ## Provider Mode
 
-Default behavior starts all 3 providers in parallel:
+Default behavior starts all 3 providers in parallel, buffers each provider's latest update, then
+sends a single coordinated `update_pool_aum` tx only when all selected providers are ready.
 
-- ChaosLabs (`update_pool_aum`)
-- Autonom (`update_oracle` multi-provider batch)
-- Switchboard (`update_oracle` native quote flow)
+- ChaosLabs (DB-backed signed batch)
+- Autonom (DB-backed signed batch)
+- Switchboard (native quote flow)
 
-To run a single provider only, use one explicit flag:
+Selection options:
 
 - `--only-chaoslabs`
 - `--only-autonom`
 - `--only-switchboard`
+- `--providers <list>` where `<list>` is comma-separated:
+  - `chaoslabs`
+  - `autonom`
+  - `switchboard`
+  - example: `--providers chaoslabs,autonom`
+
+The `--providers` flag supports single, any two-provider combination, or all three providers.
+
+### Payload shape by provider set
+
+- ChaosLabs only OR Autonom only: `BatchPrices`
+- ChaosLabs + Switchboard OR Autonom + Switchboard: `BatchPrices + SwitchboardPrices`
+- ChaosLabs + Autonom: `MultiBatchPrices`
+- ChaosLabs + Autonom + Switchboard: `MultiBatchPrices + SwitchboardPrices`
+
+### CLI examples
+
+Use your own values for:
+- `RPC_URL`
+- `PAYER_KEYPAIR`
+- `MAIN_POOL_ID` (optional; defaults to main pool id baked in `adrena-abi`)
+- `DB_STRING`
+- `COMBINED_CERT`
+- `CHAOSLABS_FEED_MAP_PATH`
+- `AUTONOM_FEED_MAP_PATH`
+- `SWITCHBOARD_API_KEY`
+- `SWITCHBOARD_FEED_MAP_PATH`
+
+#### 1 provider
+
+ChaosLabs:
+
+```bash
+cargo run --bin mroracle -- \
+  --endpoint "$RPC_URL" \
+  --payer-keypair "$PAYER_KEYPAIR" \
+  --providers chaoslabs \
+  --db-string "$DB_STRING" \
+  --combined-cert "$COMBINED_CERT" \
+  --chaoslabs-feed-map-path "$CHAOSLABS_FEED_MAP_PATH"
+```
+
+Autonom:
+
+```bash
+cargo run --bin mroracle -- \
+  --endpoint "$RPC_URL" \
+  --payer-keypair "$PAYER_KEYPAIR" \
+  --providers autonom \
+  --db-string "$DB_STRING" \
+  --combined-cert "$COMBINED_CERT" \
+  --autonom-feed-map-path "$AUTONOM_FEED_MAP_PATH"
+```
+
+Switchboard:
+
+```bash
+cargo run --bin mroracle -- \
+  --endpoint "$RPC_URL" \
+  --payer-keypair "$PAYER_KEYPAIR" \
+  --providers switchboard \
+  --switchboard-api-key "$SWITCHBOARD_API_KEY" \
+  --switchboard-feed-map-path "$SWITCHBOARD_FEED_MAP_PATH"
+```
+
+#### 2 providers
+
+ChaosLabs + Autonom:
+
+```bash
+cargo run --bin mroracle -- \
+  --endpoint "$RPC_URL" \
+  --payer-keypair "$PAYER_KEYPAIR" \
+  --providers chaoslabs,autonom \
+  --db-string "$DB_STRING" \
+  --combined-cert "$COMBINED_CERT" \
+  --chaoslabs-feed-map-path "$CHAOSLABS_FEED_MAP_PATH" \
+  --autonom-feed-map-path "$AUTONOM_FEED_MAP_PATH"
+```
+
+ChaosLabs + Switchboard:
+
+```bash
+cargo run --bin mroracle -- \
+  --endpoint "$RPC_URL" \
+  --payer-keypair "$PAYER_KEYPAIR" \
+  --providers chaoslabs,switchboard \
+  --db-string "$DB_STRING" \
+  --combined-cert "$COMBINED_CERT" \
+  --chaoslabs-feed-map-path "$CHAOSLABS_FEED_MAP_PATH" \
+  --switchboard-api-key "$SWITCHBOARD_API_KEY" \
+  --switchboard-feed-map-path "$SWITCHBOARD_FEED_MAP_PATH"
+```
+
+Autonom + Switchboard:
+
+```bash
+cargo run --bin mroracle -- \
+  --endpoint "$RPC_URL" \
+  --payer-keypair "$PAYER_KEYPAIR" \
+  --providers autonom,switchboard \
+  --db-string "$DB_STRING" \
+  --combined-cert "$COMBINED_CERT" \
+  --autonom-feed-map-path "$AUTONOM_FEED_MAP_PATH" \
+  --switchboard-api-key "$SWITCHBOARD_API_KEY" \
+  --switchboard-feed-map-path "$SWITCHBOARD_FEED_MAP_PATH"
+```
+
+#### 3 providers
+
+```bash
+cargo run --bin mroracle -- \
+  --endpoint "$RPC_URL" \
+  --payer-keypair "$PAYER_KEYPAIR" \
+  --providers chaoslabs,autonom,switchboard \
+  --db-string "$DB_STRING" \
+  --combined-cert "$COMBINED_CERT" \
+  --chaoslabs-feed-map-path "$CHAOSLABS_FEED_MAP_PATH" \
+  --autonom-feed-map-path "$AUTONOM_FEED_MAP_PATH" \
+  --switchboard-api-key "$SWITCHBOARD_API_KEY" \
+  --switchboard-feed-map-path "$SWITCHBOARD_FEED_MAP_PATH"
+```
 
 ## Switchboard Runtime (Native Quote Flow)
 
@@ -46,7 +169,7 @@ Optional overrides:
 - `--switchboard-queue-pubkey` (default mainnet queue)
 - `--switchboard-cycle-ms` (default `5000`)
 - `--switchboard-max-age-slots` (default `32`)
-- `--update-oracle-cu-limit` (default `1400000`)
+- `--update-oracle-cu-limit` (default `1400000`, compute limit for coordinated `update_pool_aum`)
 
 Feed map format example is in `feed_map_examples/switchboard_feed_map.example.json`.
 
@@ -61,7 +184,7 @@ Autonom uses:
 Optional overrides:
 
 - `--autonom-poll-ms` (default `3000`)
-- `--update-oracle-cu-limit` (shared with switchboard/autonom update_oracle txs)
+- `--update-oracle-cu-limit` (compute limit for coordinated `update_pool_aum`)
 
 Autonom feed map format:
 - `autonom_feed_map[].adrena_feed_id = <adrena provider feed id>`
@@ -87,6 +210,11 @@ It falls back to legacy `assets_price` if the new tables are unavailable.
 ## Provider Startup Behavior
 
 - In default mode, all 3 providers are attempted.
-- Missing required config for any selected provider is a startup error (hard fail).
-- `--db-string` and `--combined-cert` are required when ChaosLabs or Autonom is active.
-- ChaosLabs feed map config is required only when ChaosLabs is active.
+- If providers are explicitly selected via CLI (`--providers` or `--only-*`), startup is strict:
+  - Any selected provider init/config failure is a hard fail (process exits).
+- Without explicit provider selection, startup is soft-fail by provider:
+  - If one provider is misconfigured/unavailable, that provider is disabled.
+  - Remaining healthy providers continue running.
+- In non-explicit mode, keeper process does not exit just because one provider setup fails.
+- `--db-string` and `--combined-cert` are only required for DB-backed providers (ChaosLabs/Autonom) to be active.
+- In non-explicit mode, if all attempted providers fail startup checks, keeper stays alive in passive mode and logs errors.

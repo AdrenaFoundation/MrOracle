@@ -1,5 +1,8 @@
 use {
-    crate::{adrena_ix::SwitchboardFeedMapEntry, handlers},
+    crate::{
+        adrena_ix::SwitchboardFeedMapEntry,
+        provider_updates::{ProviderUpdate, SwitchboardOraclePricesUpdate},
+    },
     anchor_client::Program,
     anyhow::Context,
     serde::Deserialize,
@@ -14,7 +17,7 @@ use {
         crossbar::CrossbarClient,
         surge::{ConnectionState, FeedSubscription, Surge, SurgeEvent, SurgeUpdate},
     },
-    tokio::sync::Mutex,
+    tokio::sync::mpsc,
 };
 
 const SWITCHBOARD_MIN_FEED_ID: u8 = 142;
@@ -50,7 +53,6 @@ pub struct SwitchboardRuntimeConfig {
     pub queue_pubkey: Pubkey,
     pub max_age_slots: u64,
     pub cycle_timeout: Duration,
-    pub update_oracle_cu_limit: u32,
     pub feed_bindings: Vec<SwitchboardFeedBinding>,
 }
 
@@ -200,13 +202,13 @@ pub async fn validate_switchboard_feed_bindings_against_oracle(
 
 pub async fn run_switchboard_keeper(
     program: Program<Arc<Keypair>>,
-    median_priority_fee: Arc<Mutex<u64>>,
     config: SwitchboardRuntimeConfig,
+    update_sender: mpsc::Sender<ProviderUpdate>,
 ) -> Result<(), anyhow::Error> {
     validate_switchboard_feed_bindings_against_oracle(&program, &config.feed_bindings).await?;
 
     loop {
-        if let Err(err) = run_switchboard_session(&program, &median_priority_fee, &config).await {
+        if let Err(err) = run_switchboard_session(&program, &config, &update_sender).await {
             log::error!("Switchboard session failed: {:?}", err);
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
@@ -215,8 +217,8 @@ pub async fn run_switchboard_keeper(
 
 async fn run_switchboard_session(
     program: &Program<Arc<Keypair>>,
-    median_priority_fee: &Arc<Mutex<u64>>,
     config: &SwitchboardRuntimeConfig,
+    update_sender: &mpsc::Sender<ProviderUpdate>,
 ) -> Result<(), anyhow::Error> {
     let gateway_url = resolve_gateway_url(config).await?;
 
@@ -316,20 +318,16 @@ async fn run_switchboard_session(
                                 .map(SwitchboardFeedBinding::to_feed_map_entry)
                                 .collect();
 
-                            let median_priority_fee = *median_priority_fee.lock().await;
-                            if let Err(err) = handlers::update_oracle_with_switchboard(
-                                program,
-                                median_priority_fee,
-                                config.update_oracle_cu_limit,
-                                config.queue_pubkey,
-                                config.max_age_slots,
-                                switchboard_feed_map,
+                            let payload = SwitchboardOraclePricesUpdate {
+                                queue_pubkey: config.queue_pubkey,
+                                max_age_slots: config.max_age_slots,
+                                feed_map: switchboard_feed_map,
                                 updates,
-                            )
-                            .await
-                            {
-                                log::error!("Switchboard on-chain update failed: {:?}", err);
-                            }
+                            };
+                            update_sender
+                                .send(ProviderUpdate::Switchboard(payload))
+                                .await
+                                .map_err(|_| anyhow::anyhow!("switchboard provider update channel closed"))?;
 
                             pending_updates.clear();
                         }

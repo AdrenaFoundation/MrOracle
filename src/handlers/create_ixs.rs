@@ -1,5 +1,5 @@
 use {
-    crate::adrena_ix::{self, MultiBatchPrices, SwitchboardFeedMapEntry},
+    crate::adrena_ix::{self, MultiBatchPrices, SwitchboardFeedMapEntry, SwitchboardUpdateParams},
     adrena_abi::oracle::ChaosLabsBatchPrices,
     solana_sdk::{
         instruction::{AccountMeta, Instruction},
@@ -9,10 +9,22 @@ use {
 
 pub fn create_update_pool_aum_ix(
     payer: &Pubkey,
-    last_trading_prices: Option<ChaosLabsBatchPrices>,
+    pool_pubkey: Pubkey,
+    oracle_prices: Option<ChaosLabsBatchPrices>,
+    multi_oracle_prices: Option<MultiBatchPrices>,
+    switchboard_oracle_prices: Option<SwitchboardUpdateParams>,
+    quote_accounts: &[Pubkey],
     custody_accounts: &[AccountMeta],
 ) -> Result<Instruction, anyhow::Error> {
-    adrena_ix::build_update_pool_aum_ix(payer, last_trading_prices, custody_accounts)
+    adrena_ix::build_update_pool_aum_ix(
+        payer,
+        pool_pubkey,
+        oracle_prices,
+        multi_oracle_prices,
+        switchboard_oracle_prices,
+        quote_accounts,
+        custody_accounts,
+    )
 }
 
 pub fn create_update_oracle_switchboard_ix(
