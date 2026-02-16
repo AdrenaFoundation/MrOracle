@@ -205,8 +205,6 @@ pub async fn run_switchboard_keeper(
     config: SwitchboardRuntimeConfig,
     update_sender: mpsc::Sender<ProviderUpdate>,
 ) -> Result<(), anyhow::Error> {
-    validate_switchboard_feed_bindings_against_oracle(&program, &config.feed_bindings).await?;
-
     loop {
         if let Err(err) = run_switchboard_session(&program, &config, &update_sender).await {
             log::error!("Switchboard session failed: {:?}", err);

@@ -161,21 +161,9 @@ struct Args {
     #[clap(long, default_value_t = UPDATE_POOL_AUM_CU_LIMIT_WITH_SWITCHBOARD)]
     update_oracle_cu_limit: u32,
 
-    /// Deprecated (ignored): Autonom API base URL
-    #[clap(long, hide = true)]
-    autonom_api_url: Option<String>,
-
-    /// Deprecated (ignored): Autonom API key
-    #[clap(long, hide = true)]
-    autonom_api_key: Option<String>,
-
     /// Path to autonom feed mapping json
     #[clap(long)]
     autonom_feed_map_path: Option<String>,
-
-    /// Deprecated (ignored): request fresh prices from autonom
-    #[clap(long, default_value_t = false, hide = true)]
-    autonom_fresh: bool,
 
     /// Autonom polling interval in milliseconds
     #[clap(long, default_value_t = DEFAULT_AUTONOM_POLL_MS)]
@@ -378,19 +366,43 @@ async fn load_custody_accounts(
     Ok(out)
 }
 
+enum ChaosLabsUpdateCandidate {
+    OracleBatch {
+        oracle_batch_id: i64,
+        batch: ChaosLabsBatchPrices,
+    },
+    LegacyAssets {
+        dedupe_key: String,
+        batch: ChaosLabsBatchPrices,
+    },
+}
+
 async fn fetch_chaoslabs_batch_from_db(
     db_pool: &DbPool,
     feed_bindings: &[ChaosLabsFeedBinding],
-) -> Result<ChaosLabsBatchPrices, anyhow::Error> {
+) -> Result<ChaosLabsUpdateCandidate, anyhow::Error> {
     match db::get_latest_oracle_batch_by_provider(db_pool, "chaoslabs").await {
-        Ok(Some(batch)) => format_chaos_labs_oracle_batch_to_params(&batch, feed_bindings),
+        Ok(Some(batch)) => {
+            let oracle_batch_id = batch.oracle_batch_id;
+            let batch = format_chaos_labs_oracle_batch_to_params(&batch, feed_bindings)?;
+            Ok(ChaosLabsUpdateCandidate::OracleBatch {
+                oracle_batch_id,
+                batch,
+            })
+        }
         Ok(None) => {
             log::warn!(
                 "No chaoslabs batch found in oracle_batches, falling back to legacy assets_price"
             );
             match db::get_assets_prices::get_assets_prices(db_pool).await {
                 Ok(Some(assets_prices)) => {
-                    format_chaos_labs_oracle_entry_to_params(&assets_prices, feed_bindings)
+                    let dedupe_key = format!(
+                        "{}:{}",
+                        assets_prices.signature,
+                        assets_prices.latest_timestamp.timestamp_millis()
+                    );
+                    let batch = format_chaos_labs_oracle_entry_to_params(&assets_prices, feed_bindings)?;
+                    Ok(ChaosLabsUpdateCandidate::LegacyAssets { dedupe_key, batch })
                 }
                 Ok(None) => Err(anyhow::anyhow!(
                     "No chaoslabs price entry found in oracle_batches or legacy assets_price"
@@ -406,7 +418,13 @@ async fn fetch_chaoslabs_batch_from_db(
             );
             match db::get_assets_prices::get_assets_prices(db_pool).await {
                 Ok(Some(assets_prices)) => {
-                    format_chaos_labs_oracle_entry_to_params(&assets_prices, feed_bindings)
+                    let dedupe_key = format!(
+                        "{}:{}",
+                        assets_prices.signature,
+                        assets_prices.latest_timestamp.timestamp_millis()
+                    );
+                    let batch = format_chaos_labs_oracle_entry_to_params(&assets_prices, feed_bindings)?;
+                    Ok(ChaosLabsUpdateCandidate::LegacyAssets { dedupe_key, batch })
                 }
                 Ok(None) => Err(anyhow::anyhow!(
                     "No chaoslabs price entry found in legacy assets_price fallback"
@@ -424,15 +442,40 @@ async fn run_chaoslabs_keeper(
     feed_bindings: Vec<ChaosLabsFeedBinding>,
     update_sender: mpsc::Sender<ProviderUpdate>,
 ) -> Result<(), anyhow::Error> {
+    let mut last_oracle_batch_id: Option<i64> = None;
+    let mut last_legacy_dedupe_key: Option<String> = None;
+
     loop {
         let start = Instant::now();
 
         match fetch_chaoslabs_batch_from_db(&db_pool, &feed_bindings).await {
-            Ok(batch) => {
-                update_sender
-                    .send(ProviderUpdate::ChaosLabs(batch))
-                    .await
-                    .map_err(|_| anyhow::anyhow!("chaoslabs provider update channel closed"))?;
+            Ok(ChaosLabsUpdateCandidate::OracleBatch {
+                oracle_batch_id,
+                batch,
+            }) => {
+                if last_oracle_batch_id == Some(oracle_batch_id) {
+                    log::debug!(
+                        "Skipping chaoslabs batch {} (already emitted)",
+                        oracle_batch_id
+                    );
+                } else {
+                    update_sender
+                        .send(ProviderUpdate::ChaosLabs(batch))
+                        .await
+                        .map_err(|_| anyhow::anyhow!("chaoslabs provider update channel closed"))?;
+                    last_oracle_batch_id = Some(oracle_batch_id);
+                }
+            }
+            Ok(ChaosLabsUpdateCandidate::LegacyAssets { dedupe_key, batch }) => {
+                if last_legacy_dedupe_key.as_deref() == Some(dedupe_key.as_str()) {
+                    log::debug!("Skipping legacy chaoslabs fallback row (already emitted)");
+                } else {
+                    update_sender
+                        .send(ProviderUpdate::ChaosLabs(batch))
+                        .await
+                        .map_err(|_| anyhow::anyhow!("chaoslabs provider update channel closed"))?;
+                    last_legacy_dedupe_key = Some(dedupe_key);
+                }
             }
             Err(e) => {
                 log::error!("Error building chaoslabs payload from DB: {e:?}");
@@ -793,12 +836,6 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     if active_autonom {
-        if args.autonom_api_url.is_some() || args.autonom_api_key.is_some() || args.autonom_fresh {
-            log::warn!(
-                "autonom API flags are deprecated and ignored; keeper reads provider='autonom' batches from DB"
-            );
-        }
-
         let autonom_feed_map_path = args
             .autonom_feed_map_path
             .clone()

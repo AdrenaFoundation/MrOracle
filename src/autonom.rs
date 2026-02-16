@@ -60,9 +60,17 @@ pub async fn run_autonom_keeper(
     update_sender: mpsc::Sender<ProviderUpdate>,
 ) -> Result<(), anyhow::Error> {
     let alias_mapping = load_feed_map(&config.feed_map_path)?;
+    let mut last_emitted_batch_id: Option<i64> = None;
 
     loop {
-        if let Err(err) = run_autonom_cycle(&program, &config, &alias_mapping, &update_sender).await
+        if let Err(err) = run_autonom_cycle(
+            &program,
+            &config,
+            &alias_mapping,
+            &update_sender,
+            &mut last_emitted_batch_id,
+        )
+        .await
         {
             log::error!("Autonom cycle failed: {:?}", err);
         }
@@ -76,6 +84,7 @@ async fn run_autonom_cycle(
     config: &AutonomRuntimeConfig,
     alias_mapping: &AutonomAliasMapping,
     update_sender: &mpsc::Sender<ProviderUpdate>,
+    last_emitted_batch_id: &mut Option<i64>,
 ) -> Result<(), anyhow::Error> {
     let required_alias_feed_ids = fetch_required_autonom_alias_feed_ids(program).await?;
     if required_alias_feed_ids.is_empty() {
@@ -91,6 +100,15 @@ async fn run_autonom_cycle(
         }
     };
 
+    if *last_emitted_batch_id == Some(db_batch.oracle_batch_id) {
+        log::debug!(
+            "Skipping autonom batch {} (already emitted)",
+            db_batch.oracle_batch_id
+        );
+        return Ok(());
+    }
+
+    let current_batch_id = db_batch.oracle_batch_id;
     let batch =
         build_autonom_batch_prices_from_db(db_batch, &required_alias_feed_ids, alias_mapping)?;
 
@@ -98,6 +116,7 @@ async fn run_autonom_cycle(
         .send(ProviderUpdate::Autonom(batch))
         .await
         .map_err(|_| anyhow::anyhow!("autonom provider update channel closed"))?;
+    *last_emitted_batch_id = Some(current_batch_id);
 
     Ok(())
 }
