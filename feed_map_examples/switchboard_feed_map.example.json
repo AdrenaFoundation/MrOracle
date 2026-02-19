@@ -3,23 +3,33 @@
   "switchboard_feed_map": [
     {
       "adrena_feed_id": 142,
-      "switchboard_feed_hash": "1111111111111111111111111111111111111111111111111111111111111111"
+      "switchboard_feed_hash": "822512ee9add93518eca1c105a38422841a76c590db079eebb283deb2c14caa9",
+      "_comment": "SOL/USD"
     },
     {
       "adrena_feed_id": 143,
-      "switchboard_feed_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+      "switchboard_feed_hash": "8236c69fa7aa4df54d330f6c0ec6d564a41d252723df4bbf89db66ee40c38747",
+      "_comment": "jitoSOL/USD"
     },
     {
       "adrena_feed_id": 144,
-      "switchboard_feed_hash": "3333333333333333333333333333333333333333333333333333333333333333"
+      "switchboard_feed_hash": "0b83fcfc4e041a3154d015f32aa08e07486c108bd5e87512ec914f88eed9e38b",
+      "_comment": "WBTC/USD"
     },
     {
       "adrena_feed_id": 145,
-      "switchboard_feed_hash": "4444444444444444444444444444444444444444444444444444444444444444"
+      "switchboard_feed_hash": "a0950ee5ee117b2e2c30f154a69e17bfb489a7610c508dc5f67eb2a14616d8ea",
+      "_comment": "ETH/USD"
     },
     {
       "adrena_feed_id": 146,
-      "switchboard_feed_hash": "5555555555555555555555555555555555555555555555555555555555555555"
+      "switchboard_feed_hash": "f4ab6ab42006c41089ecd1f49f0c0124c323fdf5e6b97d36e9767c4029e0db7d",
+      "_comment": "BONK/USD"
+    },
+    {
+      "adrena_feed_id": 147,
+      "switchboard_feed_hash": "883ea8295f70ae506e894679d124196bb07064ea530cefd835b58c33a5ab6549",
+      "_comment": "USDC/USD"
     }
   ]
 }
