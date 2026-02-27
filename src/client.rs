@@ -51,7 +51,7 @@ const DEFAULT_SWITCHBOARD_MAINNET_QUEUE_PUBKEY: &str =
     "A43DyUGA7s8eXPxqEjJY6EBu1KKbNgfxF8h17VAHn13w";
 const DEFAULT_SWITCHBOARD_DEVNET_QUEUE_PUBKEY: &str =
     "EYiAmGSdsQTuCw413V5BzaruWuCCSDgTPtBGvLkXHbe7";
-const DEFAULT_SWITCHBOARD_CYCLE_MS: u64 = 5_000;
+const DEFAULT_SWITCHBOARD_POLL_MS: u64 = 5_000;
 const DEFAULT_SWITCHBOARD_MAX_AGE_SLOTS: u64 = 32;
 const DEFAULT_AUTONOM_POLL_MS: u64 = 3_000;
 const CHAOSLABS_CYCLE: Duration = Duration::from_secs(5);
@@ -125,10 +125,6 @@ struct Args {
     #[clap(long)]
     chaoslabs_feed_map_path: Option<String>,
 
-    /// Switchboard API key (if omitted, reads SWITCHBOARD_API_KEY env var)
-    #[clap(long)]
-    switchboard_api_key: Option<String>,
-
     /// Crossbar base URL
     #[clap(long, default_value_t = String::from(DEFAULT_SWITCHBOARD_CROSSBAR_URL))]
     switchboard_crossbar_url: String,
@@ -149,13 +145,13 @@ struct Args {
     #[clap(long)]
     switchboard_feed_map_path: Option<String>,
 
-    /// Switchboard quote max age in slots
+    /// Switchboard PullFeed max age in slots
     #[clap(long, default_value_t = DEFAULT_SWITCHBOARD_MAX_AGE_SLOTS)]
     switchboard_max_age_slots: u64,
 
-    /// Switchboard accumulation cycle length in milliseconds
-    #[clap(long, default_value_t = DEFAULT_SWITCHBOARD_CYCLE_MS)]
-    switchboard_cycle_ms: u64,
+    /// Switchboard OnDemand polling interval in milliseconds
+    #[clap(long, default_value_t = DEFAULT_SWITCHBOARD_POLL_MS)]
+    switchboard_poll_ms: u64,
 
     /// Compute unit limit for coordinated update_pool_aum tx
     #[clap(long, default_value_t = UPDATE_POOL_AUM_CU_LIMIT_WITH_SWITCHBOARD)]
@@ -666,17 +662,13 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     if active_switchboard {
-        let switchboard_api_key = args
-            .switchboard_api_key
-            .clone()
-            .or_else(|| env::var("SWITCHBOARD_API_KEY").ok());
         let switchboard_feed_map_path = args
             .switchboard_feed_map_path
             .clone()
             .or_else(|| env::var("SWITCHBOARD_FEED_MAP_PATH").ok());
 
-        match (switchboard_api_key, switchboard_feed_map_path) {
-            (Some(api_key), Some(feed_map_path)) => {
+        match switchboard_feed_map_path {
+            Some(feed_map_path) => {
                 let switchboard_feed_bindings = match switchboard::load_switchboard_feed_bindings(
                     &feed_map_path,
                 ) {
@@ -753,13 +745,12 @@ async fn main() -> Result<(), anyhow::Error> {
 
                         if active_switchboard {
                             let switchboard_cfg = switchboard::SwitchboardRuntimeConfig {
-                                api_key,
                                 crossbar_url: args.switchboard_crossbar_url.clone(),
                                 gateway_url: args.switchboard_gateway_url.clone(),
                                 network: args.switchboard_network.clone(),
                                 queue_pubkey: switchboard_queue_pubkey,
                                 max_age_slots: args.switchboard_max_age_slots,
-                                cycle_timeout: Duration::from_millis(args.switchboard_cycle_ms),
+                                poll_interval: Duration::from_millis(args.switchboard_poll_ms),
                                 feed_bindings: switchboard_feed_bindings,
                             };
 
@@ -821,14 +812,14 @@ async fn main() -> Result<(), anyhow::Error> {
                     }
                 }
             }
-            _ => {
+            None => {
                 if strict_provider_init {
                     return Err(anyhow::anyhow!(
-                        "switchboard selected via CLI but required config is missing (api key or feed map path)"
+                        "switchboard selected via CLI but required config is missing (feed map path)"
                     ));
                 }
                 log::error!(
-                    "switchboard selected but required config is missing (api key or feed map path); disabling switchboard"
+                    "switchboard selected but required config is missing (feed map path); disabling switchboard"
                 );
                 active_switchboard = false;
             }

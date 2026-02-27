@@ -1,34 +1,29 @@
 {
-  "_schema_version": "v1",
+  "_schema_version": "1",
+  "_note": "pull_feed_pubkey is the persistent on-chain PullFeed account for each feed (Switchboard OnDemand)",
   "switchboard_feed_map": [
     {
       "adrena_feed_id": 142,
-      "switchboard_feed_hash": "822512ee9add93518eca1c105a38422841a76c590db079eebb283deb2c14caa9",
-      "_comment": "SOL/USD"
+      "switchboard_feed_hash": "013b9b2fb2bdd9e3610df0d7f3e31870a1517a683efb0be2f77a8382b4085833",
+      "pull_feed_pubkey": "6qmsMwtMmeqMgZEhyLv1Pe4wcqT5iKwJAWnmzmnKjf83",
+      "_comment": "BTC/USDT"
     },
     {
       "adrena_feed_id": 143,
-      "switchboard_feed_hash": "8236c69fa7aa4df54d330f6c0ec6d564a41d252723df4bbf89db66ee40c38747",
+      "switchboard_feed_hash": "faabb8a18e5ce5e1dc02432ab98619a6aa5bb332b911332768943a1b7a455909",
+      "pull_feed_pubkey": "ASeKuaGXTDhNDttev3za4sL4qgyKALEbZRX1oHiBBVYB",
       "_comment": "jitoSOL/USD"
     },
     {
       "adrena_feed_id": 144,
-      "switchboard_feed_hash": "0b83fcfc4e041a3154d015f32aa08e07486c108bd5e87512ec914f88eed9e38b",
-      "_comment": "WBTC/USD"
-    },
-    {
-      "adrena_feed_id": 145,
-      "switchboard_feed_hash": "a0950ee5ee117b2e2c30f154a69e17bfb489a7610c508dc5f67eb2a14616d8ea",
-      "_comment": "ETH/USD"
-    },
-    {
-      "adrena_feed_id": 146,
-      "switchboard_feed_hash": "f4ab6ab42006c41089ecd1f49f0c0124c323fdf5e6b97d36e9767c4029e0db7d",
+      "switchboard_feed_hash": "d0885cda2c57d64dde7deae79c7ee8e0d3e60edaa1f99b44c7570e0290378eaf",
+      "pull_feed_pubkey": "8isKDqLnizBoL5Khp2G3onSktAgP747mnh94gYDmNsBL",
       "_comment": "BONK/USD"
     },
     {
-      "adrena_feed_id": 147,
-      "switchboard_feed_hash": "883ea8295f70ae506e894679d124196bb07064ea530cefd835b58c33a5ab6549",
+      "adrena_feed_id": 145,
+      "switchboard_feed_hash": "c08fd7753cd71667f87573a836dff813afabd49bd1465ed7be04430e8babbd09",
+      "pull_feed_pubkey": "Fy1sLiEKA5h1WqGoV7yA8q1sfqsPcuxdrzJTFuLt4MqC",
       "_comment": "USDC/USD"
     }
   ]

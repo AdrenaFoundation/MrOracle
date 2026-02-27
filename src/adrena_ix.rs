@@ -40,7 +40,7 @@ pub struct SwitchboardFeedMapEntry {
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct SwitchboardUpdateParams {
-    pub quote_instruction_indices: Vec<u8>,
+    pub submit_instruction_index: u8,
     pub max_age_slots: u64,
     pub feed_map: Vec<SwitchboardFeedMapEntry>,
 }
@@ -58,7 +58,7 @@ pub fn build_update_pool_aum_ix(
     oracle_prices: Option<ChaosLabsBatchPrices>,
     multi_oracle_prices: Option<MultiBatchPrices>,
     switchboard_oracle_prices: Option<SwitchboardUpdateParams>,
-    quote_accounts: &[Pubkey],
+    pull_feed_pubkeys: &[Pubkey],
     custody_accounts: &[AccountMeta],
 ) -> Result<Instruction, anyhow::Error> {
     let oracle_pda = adrena_abi::pda::get_oracle_pda().0;
@@ -80,8 +80,8 @@ pub fn build_update_pool_aum_ix(
 
     if switchboard_oracle_prices.is_some() {
         accounts.push(AccountMeta::new_readonly(instructions_sysvar::ID, false));
-        for quote_account in quote_accounts {
-            accounts.push(AccountMeta::new_readonly(*quote_account, false));
+        for pull_feed_pubkey in pull_feed_pubkeys {
+            accounts.push(AccountMeta::new_readonly(*pull_feed_pubkey, false));
         }
     }
 
@@ -97,7 +97,7 @@ pub fn build_update_pool_aum_ix(
 pub fn build_update_oracle_ix(
     multi_oracle_prices: Option<MultiBatchPrices>,
     switchboard_oracle_prices: Option<SwitchboardUpdateParams>,
-    quote_accounts: &[Pubkey],
+    pull_feed_pubkeys: &[Pubkey],
 ) -> Result<Instruction, anyhow::Error> {
     let oracle_pda = adrena_abi::pda::get_oracle_pda().0;
 
@@ -114,8 +114,8 @@ pub fn build_update_oracle_ix(
 
     if switchboard_oracle_prices.is_some() {
         accounts.push(AccountMeta::new_readonly(instructions_sysvar::ID, false));
-        for quote_account in quote_accounts {
-            accounts.push(AccountMeta::new_readonly(*quote_account, false));
+        for pull_feed_pubkey in pull_feed_pubkeys {
+            accounts.push(AccountMeta::new_readonly(*pull_feed_pubkey, false));
         }
     }
 
@@ -127,19 +127,19 @@ pub fn build_update_oracle_ix(
 }
 
 pub fn build_update_oracle_switchboard_ix(
-    quote_accounts: &[Pubkey],
-    quote_instruction_indices: Vec<u8>,
+    pull_feed_pubkeys: &[Pubkey],
+    submit_instruction_index: u8,
     max_age_slots: u64,
     feed_map: Vec<SwitchboardFeedMapEntry>,
 ) -> Result<Instruction, anyhow::Error> {
     build_update_oracle_ix(
         None,
         Some(SwitchboardUpdateParams {
-            quote_instruction_indices,
+            submit_instruction_index,
             max_age_slots,
             feed_map,
         }),
-        quote_accounts,
+        pull_feed_pubkeys,
     )
 }
 

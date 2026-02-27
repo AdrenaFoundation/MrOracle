@@ -8,14 +8,16 @@ use {
     serde::Deserialize,
     solana_sdk::{pubkey::Pubkey, signature::Keypair},
     std::{
-        collections::{HashMap, HashSet},
+        collections::HashSet,
         fs,
+        str::FromStr,
         sync::Arc,
         time::Duration,
     },
     switchboard_on_demand::client::{
         crossbar::CrossbarClient,
-        surge::{ConnectionState, FeedSubscription, Surge, SurgeEvent, SurgeUpdate},
+        gateway::Gateway,
+        pull_feed::{FetchUpdateManyParams, PullFeed, SbContext},
     },
     tokio::sync::mpsc,
 };
@@ -33,6 +35,7 @@ pub struct SwitchboardFeedBinding {
     pub adrena_feed_id: u8,
     pub switchboard_feed_hash_hex: String,
     pub switchboard_feed_hash: [u8; 32],
+    pub pull_feed_pubkey: Pubkey,
 }
 
 impl SwitchboardFeedBinding {
@@ -46,13 +49,12 @@ impl SwitchboardFeedBinding {
 
 #[derive(Debug, Clone)]
 pub struct SwitchboardRuntimeConfig {
-    pub api_key: String,
     pub crossbar_url: String,
     pub gateway_url: Option<String>,
     pub network: String,
     pub queue_pubkey: Pubkey,
     pub max_age_slots: u64,
-    pub cycle_timeout: Duration,
+    pub poll_interval: Duration,
     pub feed_bindings: Vec<SwitchboardFeedBinding>,
 }
 
@@ -60,6 +62,7 @@ pub struct SwitchboardRuntimeConfig {
 struct SwitchboardFeedBindingRaw {
     adrena_feed_id: u8,
     switchboard_feed_hash: String,
+    pull_feed_pubkey: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,12 +73,6 @@ enum SwitchboardFeedMapFile {
         _schema_version: Option<String>,
         switchboard_feed_map: Vec<SwitchboardFeedBindingRaw>,
     },
-}
-
-#[derive(Debug, Clone)]
-struct PendingQuoteUpdate {
-    update: SurgeUpdate,
-    covered_hashes: HashSet<String>,
 }
 
 pub fn load_switchboard_feed_bindings(
@@ -106,6 +103,7 @@ pub fn load_switchboard_feed_bindings(
 
     let mut seen_feed_ids = HashSet::new();
     let mut seen_hashes = HashSet::new();
+    let mut seen_pubkeys = HashSet::new();
     let mut bindings = Vec::with_capacity(raw_entries.len());
 
     for entry in raw_entries {
@@ -133,6 +131,13 @@ pub fn load_switchboard_feed_bindings(
             )
         })?;
 
+        let pull_feed_pubkey = Pubkey::from_str(entry.pull_feed_pubkey.trim()).with_context(|| {
+            format!(
+                "invalid pull_feed_pubkey `{}` for adrena_feed_id {}",
+                entry.pull_feed_pubkey, entry.adrena_feed_id
+            )
+        })?;
+
         if !seen_feed_ids.insert(entry.adrena_feed_id) {
             return Err(anyhow::anyhow!(
                 "duplicate switchboard adrena_feed_id {} in mapping",
@@ -147,10 +152,18 @@ pub fn load_switchboard_feed_bindings(
             ));
         }
 
+        if !seen_pubkeys.insert(pull_feed_pubkey) {
+            return Err(anyhow::anyhow!(
+                "duplicate pull_feed_pubkey `{}` in mapping",
+                pull_feed_pubkey
+            ));
+        }
+
         bindings.push(SwitchboardFeedBinding {
             adrena_feed_id: entry.adrena_feed_id,
             switchboard_feed_hash_hex: normalized_hash,
             switchboard_feed_hash,
+            pull_feed_pubkey,
         });
     }
 
@@ -205,194 +218,110 @@ pub async fn run_switchboard_keeper(
     config: SwitchboardRuntimeConfig,
     update_sender: mpsc::Sender<ProviderUpdate>,
 ) -> Result<(), anyhow::Error> {
-    loop {
-        if let Err(err) = run_switchboard_session(&program, &config, &update_sender).await {
-            log::error!("Switchboard session failed: {:?}", err);
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
-    }
-}
+    let sb_context = SbContext::new();
+    let rpc_client = program.rpc();
 
-async fn run_switchboard_session(
-    program: &Program<Arc<Keypair>>,
-    config: &SwitchboardRuntimeConfig,
-    update_sender: &mpsc::Sender<ProviderUpdate>,
-) -> Result<(), anyhow::Error> {
-    let gateway_url = resolve_gateway_url(config).await?;
+    let gateway = resolve_gateway(&config).await?;
+    let crossbar = CrossbarClient::new(&config.crossbar_url, false);
 
-    let surge = Surge::init(config.api_key.clone(), gateway_url.clone(), false);
-    let mut event_rx = surge.subscribe_events();
-
-    surge
-        .connect()
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to connect surge websocket: {e}"))?;
-    wait_for_connected_state(&surge).await?;
-
-    let subscriptions: Vec<FeedSubscription> = config
+    let feed_pubkeys: Vec<Pubkey> = config
         .feed_bindings
         .iter()
-        .map(|binding| FeedSubscription::FeedHash {
-            feed_hash: binding.switchboard_feed_hash_hex.clone(),
-        })
+        .map(|b| b.pull_feed_pubkey)
         .collect();
 
-    surge
-        .subscribe(subscriptions)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to subscribe to switchboard feeds: {e}"))?;
+    let payer_pubkey = program.payer();
 
     log::info!(
-        "Switchboard session ready: gateway={}, tracked_feeds={}, cycle={}ms, max_age_slots={}",
-        gateway_url,
-        config.feed_bindings.len(),
-        config.cycle_timeout.as_millis(),
+        "Switchboard OnDemand keeper started: feeds={}, poll={}ms, max_age_slots={}",
+        feed_pubkeys.len(),
+        config.poll_interval.as_millis(),
         config.max_age_slots
     );
 
-    let required_hashes: HashSet<String> = config
-        .feed_bindings
-        .iter()
-        .map(|entry| entry.switchboard_feed_hash_hex.clone())
-        .collect();
-
-    let mut pending_updates: HashMap<Pubkey, PendingQuoteUpdate> = HashMap::new();
-    let mut cycle_interval = tokio::time::interval(config.cycle_timeout);
-
     loop {
-        tokio::select! {
-            _ = cycle_interval.tick() => {
-                if !pending_updates.is_empty() {
-                    let covered = get_covered_hashes(&pending_updates);
-                    if covered.len() < required_hashes.len() {
-                        log::warn!(
-                            "Switchboard cycle incomplete (covered {} / {} feeds), dropping partial quote set",
-                            covered.len(),
-                            required_hashes.len(),
-                        );
-                        pending_updates.clear();
-                    }
-                }
+        match poll_switchboard_once(
+            &sb_context,
+            &rpc_client,
+            &config,
+            &gateway,
+            &crossbar,
+            &feed_pubkeys,
+            payer_pubkey,
+        )
+        .await
+        {
+            Ok(payload) => {
+                update_sender
+                    .send(ProviderUpdate::Switchboard(payload))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("switchboard provider update channel closed"))?;
             }
-            event = event_rx.recv() => {
-                match event {
-                    Ok(SurgeEvent::Connected) => {
-                        log::info!("Switchboard websocket connected");
-                    }
-                    Ok(SurgeEvent::Subscribed(_)) => {
-                        log::info!("Switchboard subscriptions acknowledged");
-                    }
-                    Ok(SurgeEvent::UnsignedUpdate(_)) => {}
-                    Ok(SurgeEvent::Update(update)) => {
-                        let covered_hashes = extract_covered_hashes(&update, &required_hashes);
-                        if covered_hashes.is_empty() {
-                            continue;
-                        }
-
-                        let quote_account = derive_quote_account(program.payer(), config.queue_pubkey, &update)?;
-                        pending_updates.insert(
-                            quote_account,
-                            PendingQuoteUpdate {
-                                update,
-                                covered_hashes,
-                            },
-                        );
-
-                        let covered = get_covered_hashes(&pending_updates);
-                        if covered.len() == required_hashes.len() {
-                            let mut ordered: Vec<(String, SurgeUpdate)> = pending_updates
-                                .iter()
-                                .map(|(quote_account, pending)| {
-                                    (quote_account.to_string(), pending.update.clone())
-                                })
-                                .collect();
-                            ordered.sort_by(|left, right| left.0.cmp(&right.0));
-
-                            let updates: Vec<SurgeUpdate> =
-                                ordered.into_iter().map(|(_, update)| update).collect();
-                            let switchboard_feed_map = config
-                                .feed_bindings
-                                .iter()
-                                .map(SwitchboardFeedBinding::to_feed_map_entry)
-                                .collect();
-
-                            let payload = SwitchboardOraclePricesUpdate {
-                                queue_pubkey: config.queue_pubkey,
-                                max_age_slots: config.max_age_slots,
-                                feed_map: switchboard_feed_map,
-                                updates,
-                            };
-                            update_sender
-                                .send(ProviderUpdate::Switchboard(payload))
-                                .await
-                                .map_err(|_| anyhow::anyhow!("switchboard provider update channel closed"))?;
-
-                            pending_updates.clear();
-                        }
-                    }
-                    Ok(SurgeEvent::Error(err)) => {
-                        return Err(anyhow::anyhow!("switchboard websocket error: {}", err));
-                    }
-                    Ok(SurgeEvent::Disconnected) => {
-                        return Err(anyhow::anyhow!("switchboard websocket disconnected"));
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        log::warn!(
-                            "Switchboard event stream lagged; skipped {} event(s)",
-                            skipped
-                        );
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        return Err(anyhow::anyhow!("switchboard event stream closed"));
-                    }
-                }
+            Err(err) => {
+                log::error!("Switchboard OnDemand poll failed: {:?}", err);
             }
         }
+
+        tokio::time::sleep(config.poll_interval).await;
     }
 }
 
-fn extract_covered_hashes(
-    update: &SurgeUpdate,
-    required_hashes: &HashSet<String>,
-) -> HashSet<String> {
-    update
-        .get_signed_feeds()
-        .into_iter()
-        .map(|hash| normalize_feed_hash(&hash))
-        .filter(|hash| required_hashes.contains(hash))
-        .collect()
-}
-
-fn get_covered_hashes(pending_updates: &HashMap<Pubkey, PendingQuoteUpdate>) -> HashSet<String> {
-    pending_updates
-        .values()
-        .flat_map(|pending| pending.covered_hashes.iter().cloned())
-        .collect()
-}
-
-fn derive_quote_account(
+async fn poll_switchboard_once(
+    context: &Arc<SbContext>,
+    rpc_client: &solana_client::nonblocking::rpc_client::RpcClient,
+    config: &SwitchboardRuntimeConfig,
+    gateway: &Gateway,
+    crossbar: &CrossbarClient,
+    feed_pubkeys: &[Pubkey],
     payer: Pubkey,
-    queue_pubkey: Pubkey,
-    update: &SurgeUpdate,
-) -> Result<Pubkey, anyhow::Error> {
-    let generated_ixs = update
-        .to_quote_ix(queue_pubkey, payer, 0)
-        .map_err(|e| anyhow::anyhow!("failed to derive quote account from surge update: {e}"))?;
+) -> Result<SwitchboardOraclePricesUpdate, anyhow::Error> {
+    let (ixs, _luts) = PullFeed::fetch_update_consensus_ix(
+        context.clone(),
+        rpc_client,
+        FetchUpdateManyParams {
+            feeds: feed_pubkeys.to_vec(),
+            payer,
+            gateway: gateway.clone(),
+            crossbar: Some(crossbar.clone()),
+            num_signatures: None,
+            debug: None,
+        },
+    )
+    .await
+    .context("PullFeed::fetch_update_consensus_ix failed")?;
 
-    let quote_program_ix = generated_ixs
-        .get(1)
-        .context("missing quote-program instruction while deriving quote account")?;
+    if ixs.len() != 2 {
+        return Err(anyhow::anyhow!(
+            "expected 2 instructions from fetch_update_consensus_ix (secp256k1 + submit), got {}",
+            ixs.len()
+        ));
+    }
 
-    quote_program_ix
-        .accounts
-        .get(1)
-        .map(|account| account.pubkey)
-        .context("missing quote account meta while deriving quote account")
+    let switchboard_feed_map: Vec<SwitchboardFeedMapEntry> = config
+        .feed_bindings
+        .iter()
+        .map(SwitchboardFeedBinding::to_feed_map_entry)
+        .collect();
+
+    let pull_feed_pubkeys: Vec<Pubkey> = config
+        .feed_bindings
+        .iter()
+        .map(|b| b.pull_feed_pubkey)
+        .collect();
+
+    Ok(SwitchboardOraclePricesUpdate {
+        queue_pubkey: config.queue_pubkey,
+        max_age_slots: config.max_age_slots,
+        feed_map: switchboard_feed_map,
+        secp_ix: ixs[0].clone(),
+        submit_ix: ixs[1].clone(),
+        pull_feed_pubkeys,
+    })
 }
 
-async fn resolve_gateway_url(config: &SwitchboardRuntimeConfig) -> Result<String, anyhow::Error> {
+async fn resolve_gateway(config: &SwitchboardRuntimeConfig) -> Result<Gateway, anyhow::Error> {
     if let Some(gateway_url) = config.gateway_url.clone() {
-        return Ok(gateway_url);
+        return Ok(Gateway::new(gateway_url));
     }
 
     let crossbar = CrossbarClient::new(&config.crossbar_url, false);
@@ -406,26 +335,15 @@ async fn resolve_gateway_url(config: &SwitchboardRuntimeConfig) -> Result<String
             )
         })?;
 
-    gateways.first().cloned().ok_or_else(|| {
+    let gateway_url = gateways.first().cloned().ok_or_else(|| {
         anyhow::anyhow!(
             "no switchboard gateways returned for network {} from {}",
             config.network,
             config.crossbar_url
         )
-    })
-}
+    })?;
 
-async fn wait_for_connected_state(surge: &Surge) -> Result<(), anyhow::Error> {
-    for _ in 0..20 {
-        if surge.get_state().await == ConnectionState::Connected {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    Err(anyhow::anyhow!(
-        "switchboard websocket did not reach connected state"
-    ))
+    Ok(Gateway::new(gateway_url))
 }
 
 fn normalize_feed_hash(hash: &str) -> String {

@@ -1,7 +1,8 @@
 use {
     crate::{
-        adrena_ix::{BatchPricesWithProvider, MultiBatchPrices, SwitchboardFeedMapEntry},
+        adrena_ix::{BatchPricesWithProvider, MultiBatchPrices},
         handlers::{create_update_oracle_multi_ix, create_update_oracle_switchboard_ix},
+        provider_updates::SwitchboardOraclePricesUpdate,
     },
     adrena_abi::oracle::ChaosLabsBatchPrices,
     anchor_client::Program,
@@ -12,7 +13,6 @@ use {
         signature::Keypair,
     },
     std::{sync::Arc, time::Duration},
-    switchboard_on_demand::client::surge::SurgeUpdate,
     tokio::time::timeout,
 };
 
@@ -42,64 +42,26 @@ pub async fn update_oracle_with_switchboard(
     program: &Program<Arc<Keypair>>,
     median_priority_fee: u64,
     update_oracle_cu_limit: u32,
-    queue_pubkey: Pubkey,
-    max_age_slots: u64,
-    feed_map: Vec<SwitchboardFeedMapEntry>,
-    updates: Vec<SurgeUpdate>,
+    switchboard_update: SwitchboardOraclePricesUpdate,
 ) -> Result<(), anyhow::Error> {
-    if updates.is_empty() {
-        return Err(anyhow::anyhow!("missing switchboard updates"));
-    }
-
     let mut ixs = vec![
         ComputeBudgetInstruction::set_compute_unit_price(median_priority_fee),
         ComputeBudgetInstruction::set_compute_unit_limit(update_oracle_cu_limit),
     ];
 
-    let mut quote_accounts = Vec::with_capacity(updates.len());
-    let mut quote_instruction_indices = Vec::with_capacity(updates.len());
+    // Append secp256k1 verification instruction.
+    ixs.push(switchboard_update.secp_ix);
 
-    for update in updates {
-        let ed25519_ix_idx = u16::try_from(ixs.len())
-            .context("too many instructions before switchboard ed25519 verification")?;
-
-        let quote_ixs = update
-            .to_quote_ix(queue_pubkey, program.payer(), ed25519_ix_idx)
-            .map_err(|e| anyhow::anyhow!("failed to convert surge update to quote ixs: {e}"))?;
-
-        if quote_ixs.len() != 2 {
-            return Err(anyhow::anyhow!(
-                "expected 2 quote instructions (ed25519 + quote update), got {}",
-                quote_ixs.len()
-            ));
-        }
-
-        let quote_ix = quote_ixs
-            .get(1)
-            .context("missing quote-program instruction in generated quote ixs")?;
-
-        let quote_account = quote_ix
-            .accounts
-            .get(1)
-            .map(|meta| meta.pubkey)
-            .context("missing quote account meta in quote-program instruction")?;
-
-        let quote_ix_index = usize::from(ed25519_ix_idx)
-            .checked_add(1)
-            .context("quote instruction index overflow")?;
-        let quote_ix_index =
-            u8::try_from(quote_ix_index).context("quote instruction index exceeds u8")?;
-
-        quote_accounts.push(quote_account);
-        quote_instruction_indices.push(quote_ix_index);
-        ixs.extend(quote_ixs);
-    }
+    // Append PullFeedSubmitResponseConsensus instruction and record its index.
+    let submit_ix_index = u8::try_from(ixs.len())
+        .context("submit instruction index exceeds u8")?;
+    ixs.push(switchboard_update.submit_ix);
 
     let update_oracle_ix = create_update_oracle_switchboard_ix(
-        &quote_accounts,
-        quote_instruction_indices,
-        max_age_slots,
-        feed_map,
+        &switchboard_update.pull_feed_pubkeys,
+        submit_ix_index,
+        switchboard_update.max_age_slots,
+        switchboard_update.feed_map,
     )?;
     ixs.push(update_oracle_ix);
 

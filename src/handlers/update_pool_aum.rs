@@ -1,8 +1,7 @@
 use {
     crate::{
         adrena_ix::{
-            BatchPricesWithProvider, MultiBatchPrices, SwitchboardFeedMapEntry,
-            SwitchboardUpdateParams,
+            BatchPricesWithProvider, MultiBatchPrices, SwitchboardUpdateParams,
         },
         handlers::create_update_pool_aum_ix,
         provider_updates::SwitchboardOraclePricesUpdate,
@@ -19,7 +18,6 @@ use {
         signature::Keypair,
     },
     std::{sync::Arc, time::Duration},
-    switchboard_on_demand::client::surge::SurgeUpdate,
     tokio::time::timeout,
 };
 
@@ -98,10 +96,7 @@ pub async fn update_pool_aum_with_switchboard(
     pool_pubkey: Pubkey,
     median_priority_fee: u64,
     update_pool_aum_cu_limit: u32,
-    queue_pubkey: Pubkey,
-    max_age_slots: u64,
-    feed_map: Vec<SwitchboardFeedMapEntry>,
-    updates: Vec<SurgeUpdate>,
+    switchboard_update: SwitchboardOraclePricesUpdate,
     custody_accounts: Vec<AccountMeta>,
 ) -> Result<(), anyhow::Error> {
     let ixs = build_update_pool_aum_instruction_sequence(
@@ -111,12 +106,7 @@ pub async fn update_pool_aum_with_switchboard(
         update_pool_aum_cu_limit,
         None,
         None,
-        Some(SwitchboardOraclePricesUpdate {
-            queue_pubkey,
-            max_age_slots,
-            feed_map,
-            updates,
-        }),
+        Some(switchboard_update),
         custody_accounts,
     )?;
     send_update_pool_aum_transaction(program, ixs, "switchboard").await
@@ -137,57 +127,20 @@ fn build_update_pool_aum_instruction_sequence(
         ComputeBudgetInstruction::set_compute_unit_limit(update_pool_aum_cu_limit),
     ];
 
-    let mut quote_accounts = Vec::new();
+    let mut pull_feed_pubkeys = Vec::new();
     let switchboard_params = if let Some(switchboard_update) = switchboard_oracle_prices {
-        if switchboard_update.updates.is_empty() {
-            return Err(anyhow::anyhow!("missing switchboard updates"));
-        }
+        // Append secp256k1 verification instruction.
+        ixs.push(switchboard_update.secp_ix);
 
-        let mut quote_instruction_indices = Vec::with_capacity(switchboard_update.updates.len());
-        quote_accounts = Vec::with_capacity(switchboard_update.updates.len());
+        // Append PullFeedSubmitResponseConsensus instruction and record its index.
+        let submit_ix_index = u8::try_from(ixs.len())
+            .context("submit instruction index exceeds u8")?;
+        ixs.push(switchboard_update.submit_ix);
 
-        for update in switchboard_update.updates {
-            let ed25519_ix_idx = u16::try_from(ixs.len())
-                .context("too many instructions before switchboard ed25519 verification")?;
-
-            let quote_ixs = update
-                .to_quote_ix(
-                    switchboard_update.queue_pubkey,
-                    program.payer(),
-                    ed25519_ix_idx,
-                )
-                .map_err(|e| anyhow::anyhow!("failed to convert surge update to quote ixs: {e}"))?;
-
-            if quote_ixs.len() != 2 {
-                return Err(anyhow::anyhow!(
-                    "expected 2 quote instructions (ed25519 + quote update), got {}",
-                    quote_ixs.len()
-                ));
-            }
-
-            let quote_ix = quote_ixs
-                .get(1)
-                .context("missing quote-program instruction in generated quote ixs")?;
-
-            let quote_account = quote_ix
-                .accounts
-                .get(1)
-                .map(|meta| meta.pubkey)
-                .context("missing quote account meta in quote-program instruction")?;
-
-            let quote_ix_index = usize::from(ed25519_ix_idx)
-                .checked_add(1)
-                .context("quote instruction index overflow")?;
-            let quote_ix_index =
-                u8::try_from(quote_ix_index).context("quote instruction index exceeds u8")?;
-
-            quote_accounts.push(quote_account);
-            quote_instruction_indices.push(quote_ix_index);
-            ixs.extend(quote_ixs);
-        }
+        pull_feed_pubkeys = switchboard_update.pull_feed_pubkeys;
 
         Some(SwitchboardUpdateParams {
-            quote_instruction_indices,
+            submit_instruction_index: submit_ix_index,
             max_age_slots: switchboard_update.max_age_slots,
             feed_map: switchboard_update.feed_map,
         })
@@ -201,7 +154,7 @@ fn build_update_pool_aum_instruction_sequence(
         oracle_prices,
         multi_oracle_prices,
         switchboard_params,
-        &quote_accounts,
+        &pull_feed_pubkeys,
         &custody_accounts,
     )?;
     ixs.push(update_pool_aum_ix);

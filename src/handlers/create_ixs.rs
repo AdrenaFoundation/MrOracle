@@ -13,7 +13,7 @@ pub fn create_update_pool_aum_ix(
     oracle_prices: Option<ChaosLabsBatchPrices>,
     multi_oracle_prices: Option<MultiBatchPrices>,
     switchboard_oracle_prices: Option<SwitchboardUpdateParams>,
-    quote_accounts: &[Pubkey],
+    pull_feed_pubkeys: &[Pubkey],
     custody_accounts: &[AccountMeta],
 ) -> Result<Instruction, anyhow::Error> {
     adrena_ix::build_update_pool_aum_ix(
@@ -22,20 +22,20 @@ pub fn create_update_pool_aum_ix(
         oracle_prices,
         multi_oracle_prices,
         switchboard_oracle_prices,
-        quote_accounts,
+        pull_feed_pubkeys,
         custody_accounts,
     )
 }
 
 pub fn create_update_oracle_switchboard_ix(
-    quote_accounts: &[Pubkey],
-    quote_instruction_indices: Vec<u8>,
+    pull_feed_pubkeys: &[Pubkey],
+    submit_instruction_index: u8,
     max_age_slots: u64,
     feed_map: Vec<SwitchboardFeedMapEntry>,
 ) -> Result<Instruction, anyhow::Error> {
     adrena_ix::build_update_oracle_switchboard_ix(
-        quote_accounts,
-        quote_instruction_indices,
+        pull_feed_pubkeys,
+        submit_instruction_index,
         max_age_slots,
         feed_map,
     )
