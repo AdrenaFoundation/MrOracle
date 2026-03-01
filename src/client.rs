@@ -51,10 +51,10 @@ const DEFAULT_SWITCHBOARD_MAINNET_QUEUE_PUBKEY: &str =
     "A43DyUGA7s8eXPxqEjJY6EBu1KKbNgfxF8h17VAHn13w";
 const DEFAULT_SWITCHBOARD_DEVNET_QUEUE_PUBKEY: &str =
     "EYiAmGSdsQTuCw413V5BzaruWuCCSDgTPtBGvLkXHbe7";
-const DEFAULT_SWITCHBOARD_POLL_MS: u64 = 5_000;
+const DEFAULT_SWITCHBOARD_POLL_MS: u64 = 2_000;
 const DEFAULT_SWITCHBOARD_MAX_AGE_SLOTS: u64 = 32;
-const DEFAULT_AUTONOM_POLL_MS: u64 = 3_000;
-const CHAOSLABS_CYCLE: Duration = Duration::from_secs(5);
+const DEFAULT_AUTONOM_POLL_MS: u64 = 2_000;
+const CHAOSLABS_CYCLE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
 enum ArgsCommitment {
@@ -488,6 +488,8 @@ async fn run_chaoslabs_keeper(
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
+    dotenvy::dotenv().ok();
+
     env::set_var(
         env_logger::DEFAULT_FILTER_ENV,
         env::var_os(env_logger::DEFAULT_FILTER_ENV).unwrap_or_else(|| "info".into()),
