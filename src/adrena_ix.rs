@@ -1,12 +1,11 @@
 use {
-    adrena_abi::{self, oracle::ChaosLabsBatchPrices, CORTEX_ID},
+    adrena_abi::{self, oracle::BatchPrices},
     anyhow::Context,
     borsh::{BorshDeserialize, BorshSerialize},
     sha2::{Digest, Sha256},
     solana_sdk::{
         instruction::{AccountMeta, Instruction},
         pubkey::Pubkey,
-        sysvar::instructions as instructions_sysvar,
     },
 };
 
@@ -17,7 +16,7 @@ pub const ORACLE_PROVIDER_SWITCHBOARD: u8 = 2;
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct BatchPricesWithProvider {
     pub provider: u8,
-    pub batch: ChaosLabsBatchPrices,
+    pub batch: BatchPrices,
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -27,7 +26,7 @@ pub struct MultiBatchPrices {
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct UpdatePoolAumParams {
-    pub oracle_prices: Option<ChaosLabsBatchPrices>,
+    pub oracle_prices: Option<BatchPrices>,
     pub multi_oracle_prices: Option<MultiBatchPrices>,
     pub switchboard_oracle_prices: Option<SwitchboardUpdateParams>,
 }
@@ -40,14 +39,13 @@ pub struct SwitchboardFeedMapEntry {
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct SwitchboardUpdateParams {
-    pub submit_instruction_index: u8,
     pub max_age_slots: u64,
     pub feed_map: Vec<SwitchboardFeedMapEntry>,
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct UpdateOracleParams {
-    pub oracle_prices: Option<ChaosLabsBatchPrices>,
+    pub oracle_prices: Option<BatchPrices>,
     pub multi_oracle_prices: Option<MultiBatchPrices>,
     pub switchboard_oracle_prices: Option<SwitchboardUpdateParams>,
 }
@@ -55,10 +53,10 @@ pub struct UpdateOracleParams {
 pub fn build_update_pool_aum_ix(
     payer: &Pubkey,
     pool_pubkey: Pubkey,
-    oracle_prices: Option<ChaosLabsBatchPrices>,
+    oracle_prices: Option<BatchPrices>,
     multi_oracle_prices: Option<MultiBatchPrices>,
     switchboard_oracle_prices: Option<SwitchboardUpdateParams>,
-    pull_feed_pubkeys: &[Pubkey],
+    quote_account: Option<Pubkey>,
     custody_accounts: &[AccountMeta],
 ) -> Result<Instruction, anyhow::Error> {
     let oracle_pda = adrena_abi::pda::get_oracle_pda().0;
@@ -72,17 +70,15 @@ pub fn build_update_pool_aum_ix(
 
     let mut accounts = vec![
         AccountMeta::new(*payer, true),
-        AccountMeta::new_readonly(CORTEX_ID, false),
+        AccountMeta::new_readonly(adrena_abi::pda::get_cortex_pda().0, false),
         AccountMeta::new(pool_pubkey, false),
         AccountMeta::new(oracle_pda, false),
         AccountMeta::new_readonly(lp_token_mint_pubkey, false),
     ];
 
-    if switchboard_oracle_prices.is_some() {
-        accounts.push(AccountMeta::new_readonly(instructions_sysvar::ID, false));
-        for pull_feed_pubkey in pull_feed_pubkeys {
-            accounts.push(AccountMeta::new_readonly(*pull_feed_pubkey, false));
-        }
+    // SwitchboardQuote canonical PDA as the first remaining_account
+    if let Some(quote_pubkey) = quote_account {
+        accounts.push(AccountMeta::new_readonly(quote_pubkey, false));
     }
 
     accounts.extend_from_slice(custody_accounts);
@@ -97,7 +93,7 @@ pub fn build_update_pool_aum_ix(
 pub fn build_update_oracle_ix(
     multi_oracle_prices: Option<MultiBatchPrices>,
     switchboard_oracle_prices: Option<SwitchboardUpdateParams>,
-    pull_feed_pubkeys: &[Pubkey],
+    quote_account: Option<Pubkey>,
 ) -> Result<Instruction, anyhow::Error> {
     let oracle_pda = adrena_abi::pda::get_oracle_pda().0;
 
@@ -108,15 +104,13 @@ pub fn build_update_oracle_ix(
     };
 
     let mut accounts = vec![
-        AccountMeta::new_readonly(CORTEX_ID, false),
+        AccountMeta::new_readonly(adrena_abi::pda::get_cortex_pda().0, false),
         AccountMeta::new(oracle_pda, false),
     ];
 
-    if switchboard_oracle_prices.is_some() {
-        accounts.push(AccountMeta::new_readonly(instructions_sysvar::ID, false));
-        for pull_feed_pubkey in pull_feed_pubkeys {
-            accounts.push(AccountMeta::new_readonly(*pull_feed_pubkey, false));
-        }
+    // SwitchboardQuote canonical PDA as the first remaining_account
+    if let Some(quote_pubkey) = quote_account {
+        accounts.push(AccountMeta::new_readonly(quote_pubkey, false));
     }
 
     Ok(Instruction {
@@ -127,26 +121,24 @@ pub fn build_update_oracle_ix(
 }
 
 pub fn build_update_oracle_switchboard_ix(
-    pull_feed_pubkeys: &[Pubkey],
-    submit_instruction_index: u8,
+    quote_account: Pubkey,
     max_age_slots: u64,
     feed_map: Vec<SwitchboardFeedMapEntry>,
 ) -> Result<Instruction, anyhow::Error> {
     build_update_oracle_ix(
         None,
         Some(SwitchboardUpdateParams {
-            submit_instruction_index,
             max_age_slots,
             feed_map,
         }),
-        pull_feed_pubkeys,
+        Some(quote_account),
     )
 }
 
 pub fn build_update_oracle_multi_ix(
     multi_oracle_prices: MultiBatchPrices,
 ) -> Result<Instruction, anyhow::Error> {
-    build_update_oracle_ix(Some(multi_oracle_prices), None, &[])
+    build_update_oracle_ix(Some(multi_oracle_prices), None, None)
 }
 
 fn encode_instruction_data<T: BorshSerialize>(

@@ -1,5 +1,5 @@
 use {
-    crate::adrena_ix::SwitchboardFeedMapEntry, adrena_abi::oracle::ChaosLabsBatchPrices,
+    crate::adrena_ix::SwitchboardFeedMapEntry, adrena_abi::oracle::BatchPrices,
     solana_sdk::{instruction::Instruction, pubkey::Pubkey},
 };
 
@@ -8,17 +8,17 @@ pub struct SwitchboardOraclePricesUpdate {
     pub queue_pubkey: Pubkey,
     pub max_age_slots: u64,
     pub feed_map: Vec<SwitchboardFeedMapEntry>,
-    /// The secp256k1 signature verification instruction (precedes submit).
-    pub secp_ix: Instruction,
-    /// The PullFeedSubmitResponseConsensus instruction.
-    pub submit_ix: Instruction,
-    /// PullFeed account pubkeys, in the same order as feed_map.
-    pub pull_feed_pubkeys: Vec<Pubkey>,
+    /// Ed25519 signature verification instruction (precedes quote store).
+    pub ed25519_ix: Instruction,
+    /// Quote program store instruction (updates the canonical SwitchboardQuote PDA).
+    pub quote_store_ix: Instruction,
+    /// Canonical SwitchboardQuote PDA pubkey (derived from queue + feed hashes).
+    pub quote_account: Pubkey,
 }
 
 #[derive(Debug, Clone)]
 pub enum ProviderUpdate {
-    ChaosLabs(ChaosLabsBatchPrices),
-    Autonom(ChaosLabsBatchPrices),
+    ChaosLabs(BatchPrices),
+    Autonom(BatchPrices),
     Switchboard(SwitchboardOraclePricesUpdate),
 }

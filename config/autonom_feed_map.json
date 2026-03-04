@@ -1,0 +1,46 @@
+{
+  "_schema_version": "1",
+  "autonom_feed_map": [
+    {
+      "adrena_feed_id": 30,
+      "autonom_feed_id": 3001,
+      "_symbol": "BTC (Bitcoin)"
+    },
+    {
+      "adrena_feed_id": 31,
+      "autonom_feed_id": 3005,
+      "_symbol": "jitoSOL",
+      "_WARNING": "TEMPORARY: Autonom has no jitoSOL feed — using SOL (3005) as placeholder until jitoSOL is available"
+    },
+    {
+      "adrena_feed_id": 32,
+      "autonom_feed_id": 3016,
+      "_symbol": "BONK"
+    },
+    {
+      "adrena_feed_id": 33,
+      "autonom_feed_id": 4001,
+      "_symbol": "USDC"
+    },
+    {
+      "adrena_feed_id": 34,
+      "autonom_feed_id": 2056,
+      "_symbol": "XAU (Gold Spot)"
+    },
+    {
+      "adrena_feed_id": 35,
+      "autonom_feed_id": 2069,
+      "_symbol": "XAG (Silver Spot)"
+    },
+    {
+      "adrena_feed_id": 36,
+      "autonom_feed_id": 2015,
+      "_symbol": "HG1 (Copper Futures)"
+    },
+    {
+      "adrena_feed_id": 37,
+      "autonom_feed_id": 2062,
+      "_symbol": "XPT (Platinum Spot)"
+    }
+  ]
+}

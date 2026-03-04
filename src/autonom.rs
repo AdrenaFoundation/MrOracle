@@ -1,6 +1,6 @@
 use {
     crate::{db::OracleBatch, provider_updates::ProviderUpdate},
-    adrena_abi::oracle::{ChaosLabsBatchPrices, PriceData},
+    adrena_abi::oracle::{BatchPrices, PriceData},
     anchor_client::Program,
     anyhow::Context,
     deadpool_postgres::Pool as DbPool,
@@ -20,11 +20,6 @@ const AUTONOM_PROVIDER: &str = "autonom";
 const AUTONOM_MIN_FEED_ID: u8 = 30;
 const AUTONOM_MAX_FEED_ID: u8 = 141;
 
-const ADRENA_ORACLE_DISCRIMINATOR_LEN: usize = 8;
-const ADRENA_ORACLE_HEADER_LEN: usize = 16;
-const ADRENA_ORACLE_PRICE_SLOT_LEN: usize = 64;
-const ADRENA_ORACLE_PRICE_FEED_ID_OFFSET: usize = 28;
-const ADRENA_ORACLE_PRICE_NAME_LEN_OFFSET: usize = 63;
 
 #[derive(Debug, Clone)]
 pub struct AutonomRuntimeConfig {
@@ -60,6 +55,20 @@ pub async fn run_autonom_keeper(
     update_sender: mpsc::Sender<ProviderUpdate>,
 ) -> Result<(), anyhow::Error> {
     let alias_mapping = load_feed_map(&config.feed_map_path)?;
+
+    // Derive required feed IDs from the config file (source of truth)
+    let mut required_alias_feed_ids: Vec<u8> = alias_mapping
+        .alias_by_canonical
+        .values()
+        .copied()
+        .collect();
+    required_alias_feed_ids.sort_unstable();
+
+    log::info!(
+        "Autonom keeper: required alias feed_ids from config: {:?}",
+        required_alias_feed_ids
+    );
+
     let mut last_emitted_batch_id: Option<i64> = None;
 
     loop {
@@ -69,6 +78,7 @@ pub async fn run_autonom_keeper(
             &alias_mapping,
             &update_sender,
             &mut last_emitted_batch_id,
+            &required_alias_feed_ids,
         )
         .await
         {
@@ -80,17 +90,13 @@ pub async fn run_autonom_keeper(
 }
 
 async fn run_autonom_cycle(
-    program: &Program<Arc<Keypair>>,
+    _program: &Program<Arc<Keypair>>,
     config: &AutonomRuntimeConfig,
     alias_mapping: &AutonomAliasMapping,
     update_sender: &mpsc::Sender<ProviderUpdate>,
     last_emitted_batch_id: &mut Option<i64>,
+    required_alias_feed_ids: &[u8],
 ) -> Result<(), anyhow::Error> {
-    let required_alias_feed_ids = fetch_required_autonom_alias_feed_ids(program).await?;
-    if required_alias_feed_ids.is_empty() {
-        log::warn!("No registered Autonom feed ids found in oracle account; skipping cycle");
-        return Ok(());
-    }
 
     let db_batch = match fetch_latest_autonom_batch_from_db(&config.db_pool).await? {
         Some(batch) => batch,
@@ -121,57 +127,17 @@ async fn run_autonom_cycle(
     Ok(())
 }
 
-async fn fetch_required_autonom_alias_feed_ids(
-    program: &Program<Arc<Keypair>>,
-) -> Result<Vec<u8>, anyhow::Error> {
-    let oracle_pda = adrena_abi::pda::get_oracle_pda().0;
-    let account_data = program
-        .rpc()
-        .get_account_data(&oracle_pda)
-        .await
-        .with_context(|| format!("failed to fetch oracle account data at {oracle_pda}"))?;
-
-    Ok(parse_registered_autonom_feed_ids(&account_data))
-}
-
 async fn fetch_latest_autonom_batch_from_db(
     db_pool: &DbPool,
 ) -> Result<Option<OracleBatch>, anyhow::Error> {
     crate::db::get_latest_oracle_batch_by_provider(db_pool, AUTONOM_PROVIDER).await
 }
 
-fn parse_registered_autonom_feed_ids(account_data: &[u8]) -> Vec<u8> {
-    if account_data.len() <= ADRENA_ORACLE_DISCRIMINATOR_LEN + ADRENA_ORACLE_HEADER_LEN {
-        return Vec::new();
-    }
-
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-
-    let mut offset = ADRENA_ORACLE_DISCRIMINATOR_LEN + ADRENA_ORACLE_HEADER_LEN;
-    while offset + ADRENA_ORACLE_PRICE_SLOT_LEN <= account_data.len() {
-        let feed_id = account_data[offset + ADRENA_ORACLE_PRICE_FEED_ID_OFFSET];
-        let name_len = account_data[offset + ADRENA_ORACLE_PRICE_NAME_LEN_OFFSET];
-
-        if name_len > 0
-            && (AUTONOM_MIN_FEED_ID..=AUTONOM_MAX_FEED_ID).contains(&feed_id)
-            && seen.insert(feed_id)
-        {
-            out.push(feed_id);
-        }
-
-        offset += ADRENA_ORACLE_PRICE_SLOT_LEN;
-    }
-
-    out.sort_unstable();
-    out
-}
-
 fn build_autonom_batch_prices_from_db(
     db_batch: OracleBatch,
     required_alias_feed_ids: &[u8],
     alias_mapping: &AutonomAliasMapping,
-) -> Result<ChaosLabsBatchPrices, anyhow::Error> {
+) -> Result<BatchPrices, anyhow::Error> {
     if db_batch.provider != AUTONOM_PROVIDER {
         return Err(anyhow::anyhow!(
             "received non-autonom batch from DB provider={} batch_id={}",
@@ -180,7 +146,12 @@ fn build_autonom_batch_prices_from_db(
         ));
     }
 
+    // CRITICAL: Preserve the DB insertion order (oracle_batch_price_id ASC).
+    // The API signs the batch in its response order. The on-chain
+    // build_message_hash() reconstructs the hash in the order prices appear.
+    // Reordering would break signature verification (InvalidOracleSignature).
     let mut entries_by_alias = HashMap::<u8, PriceData>::new();
+    let mut insertion_order: Vec<u8> = Vec::new();
 
     for price in db_batch.prices {
         if price.exponent != -10 {
@@ -227,6 +198,7 @@ fn build_autonom_batch_prices_from_db(
                 }
             }
             None => {
+                insertion_order.push(alias_feed_id);
                 entries_by_alias.insert(alias_feed_id, new_price);
             }
         }
@@ -273,10 +245,13 @@ fn build_autonom_batch_prices_from_db(
             u8::try_from(id).map_err(|_| anyhow::anyhow!("invalid autonom recovery_id {}", id))
         })?;
 
-    let mut prices: Vec<PriceData> = entries_by_alias.into_values().collect();
-    prices.sort_by_key(|price| price.feed_id);
+    // Build prices in DB insertion order (preserved via insertion_order vec)
+    let prices: Vec<PriceData> = insertion_order
+        .iter()
+        .filter_map(|alias_id| entries_by_alias.get(alias_id).copied())
+        .collect();
 
-    Ok(ChaosLabsBatchPrices {
+    Ok(BatchPrices {
         prices,
         signature,
         recovery_id,

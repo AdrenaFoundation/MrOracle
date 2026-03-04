@@ -1,0 +1,25 @@
+{
+  "_schema_version": "1",
+  "chaoslabs_feed_map": [
+    {
+      "adrena_feed_id": 1,
+      "source_price_field": "jitosolusd_price",
+      "source_timestamp_field": "jitosolusd_price_ts"
+    },
+    {
+      "adrena_feed_id": 2,
+      "source_price_field": "btcusd_price",
+      "source_timestamp_field": "btcusd_price_ts"
+    },
+    {
+      "adrena_feed_id": 4,
+      "source_price_field": "bonkusd_price",
+      "source_timestamp_field": "bonkusd_price_ts"
+    },
+    {
+      "adrena_feed_id": 5,
+      "source_price_field": "usdcusd_price",
+      "source_timestamp_field": "usdcusd_price_ts"
+    }
+  ]
+}

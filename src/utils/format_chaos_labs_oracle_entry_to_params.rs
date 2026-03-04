@@ -1,11 +1,11 @@
 use {
     crate::db::{get_assets_prices::AssetsPrices, OracleBatch},
-    adrena_abi::oracle::{ChaosLabsBatchPrices, PriceData},
+    adrena_abi::oracle::{BatchPrices, PriceData},
     anyhow::Context,
     rust_decimal::prelude::ToPrimitive,
     serde::Deserialize,
     std::{
-        collections::{HashMap, HashSet},
+        collections::HashSet,
         fs,
     },
 };
@@ -176,7 +176,7 @@ pub fn load_chaos_labs_feed_map(
 pub fn format_chaos_labs_oracle_entry_to_params(
     chaos_labs_oracle_entry: &AssetsPrices,
     feed_bindings: &[ChaosLabsFeedBinding],
-) -> Result<ChaosLabsBatchPrices, anyhow::Error> {
+) -> Result<BatchPrices, anyhow::Error> {
     if feed_bindings.is_empty() {
         return Err(anyhow::anyhow!("chaoslabs feed mapping is empty"));
     }
@@ -199,7 +199,7 @@ pub fn format_chaos_labs_oracle_entry_to_params(
         });
     }
 
-    Ok(ChaosLabsBatchPrices {
+    Ok(BatchPrices {
         prices,
         signature: signature_vec,
         recovery_id,
@@ -209,7 +209,7 @@ pub fn format_chaos_labs_oracle_entry_to_params(
 pub fn format_chaos_labs_oracle_batch_to_params(
     oracle_batch: &OracleBatch,
     feed_bindings: &[ChaosLabsFeedBinding],
-) -> Result<ChaosLabsBatchPrices, anyhow::Error> {
+) -> Result<BatchPrices, anyhow::Error> {
     if feed_bindings.is_empty() {
         return Err(anyhow::anyhow!("chaoslabs feed mapping is empty"));
     }
@@ -239,7 +239,16 @@ pub fn format_chaos_labs_oracle_batch_to_params(
             u8::try_from(id).map_err(|_| anyhow::anyhow!("invalid chaoslabs recovery_id {}", id))
         })?;
 
-    let mut prices_by_feed_id = HashMap::<u8, &crate::db::OracleBatchPrice>::new();
+    // Build a set of expected feed IDs from the feed map for validation.
+    let expected_feed_ids: HashSet<u8> = feed_bindings.iter().map(|b| b.adrena_feed_id).collect();
+
+    // CRITICAL: Iterate over DB prices in insertion order (oracle_batch_price_id ASC).
+    // The ChaosLabs API signs the batch in its response order. The on-chain
+    // build_message_hash() reconstructs the hash in the order prices appear.
+    // Reordering would break signature verification (InvalidOracleSignature).
+    let mut prices = Vec::with_capacity(feed_bindings.len());
+    let mut seen_feed_ids = HashSet::new();
+
     for price_row in &oracle_batch.prices {
         let feed_id = u8::try_from(price_row.feed_id).map_err(|_| {
             anyhow::anyhow!(
@@ -248,7 +257,12 @@ pub fn format_chaos_labs_oracle_batch_to_params(
             )
         })?;
 
-        if prices_by_feed_id.contains_key(&feed_id) {
+        // Skip feeds not in our feed map
+        if !expected_feed_ids.contains(&feed_id) {
+            continue;
+        }
+
+        if !seen_feed_ids.insert(feed_id) {
             return Err(anyhow::anyhow!(
                 "duplicate chaoslabs batch feed_id {} in batch {}",
                 feed_id,
@@ -256,45 +270,43 @@ pub fn format_chaos_labs_oracle_batch_to_params(
             ));
         }
 
-        prices_by_feed_id.insert(feed_id, price_row);
-    }
-
-    let mut prices = Vec::with_capacity(feed_bindings.len());
-    for binding in feed_bindings {
-        let batch_price_row = prices_by_feed_id
-            .get(&binding.adrena_feed_id)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "missing chaoslabs price for feed_id {} in batch {}",
-                    binding.adrena_feed_id,
-                    oracle_batch.oracle_batch_id
-                )
-            })?;
-
-        if batch_price_row.exponent != -10 {
+        if price_row.exponent != -10 {
             return Err(anyhow::anyhow!(
                 "unsupported chaoslabs exponent {} for feed_id {}",
-                batch_price_row.exponent,
-                binding.adrena_feed_id
+                price_row.exponent,
+                feed_id
             ));
         }
 
-        let normalized_price = batch_price_row.price.to_u64().ok_or_else(|| {
+        let normalized_price = price_row.price.to_u64().ok_or_else(|| {
             anyhow::anyhow!(
                 "failed to convert chaoslabs price {} to u64 for feed_id {}",
-                batch_price_row.price,
-                binding.adrena_feed_id
+                price_row.price,
+                feed_id
             )
         })?;
 
         prices.push(PriceData {
-            feed_id: binding.adrena_feed_id,
+            feed_id,
             price: normalized_price,
-            timestamp: batch_price_row.price_timestamp.timestamp(),
+            timestamp: price_row.price_timestamp.timestamp(),
         });
     }
 
-    Ok(ChaosLabsBatchPrices {
+    // Verify all expected feeds were found
+    let missing: Vec<u8> = expected_feed_ids
+        .difference(&seen_feed_ids)
+        .copied()
+        .collect();
+    if !missing.is_empty() {
+        return Err(anyhow::anyhow!(
+            "missing chaoslabs price(s) for feed_id(s) {:?} in batch {}",
+            missing,
+            oracle_batch.oracle_batch_id
+        ));
+    }
+
+    Ok(BatchPrices {
         prices,
         signature: signature_vec,
         recovery_id,

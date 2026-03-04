@@ -71,7 +71,7 @@ pub async fn get_latest_oracle_batch_by_provider(
                 source_feed_id
             FROM oracle_batch_prices
             WHERE oracle_batch_id = $1
-            ORDER BY feed_id ASC",
+            ORDER BY oracle_batch_price_id ASC",
             &[&oracle_batch_id],
         )
         .await

@@ -1,10 +1,13 @@
 use {
     anchor_client::{
-        solana_sdk::{signature::Keypair, signer::keypair::read_keypair_file},
+        solana_sdk::{
+            signature::Keypair,
+            signer::keypair::read_keypair_file,
+        },
         Client, Cluster, Program,
     },
     clap::Parser,
-    openssl::ssl::{SslConnector, SslMethod},
+    openssl::ssl::{SslConnector, SslMethod, SslVerifyMode},
     postgres_openssl::MakeTlsConnector,
     priority_fees::fetch_mean_priority_fee,
     solana_sdk::{instruction::AccountMeta, pubkey::Pubkey},
@@ -25,7 +28,7 @@ pub mod switchboard;
 pub mod utils;
 
 use {
-    adrena_abi::oracle::ChaosLabsBatchPrices,
+    adrena_abi::oracle::BatchPrices,
     adrena_ix::{
         BatchPricesWithProvider, MultiBatchPrices, ORACLE_PROVIDER_AUTONOM,
         ORACLE_PROVIDER_CHAOS_LABS,
@@ -53,8 +56,16 @@ const DEFAULT_SWITCHBOARD_DEVNET_QUEUE_PUBKEY: &str =
     "EYiAmGSdsQTuCw413V5BzaruWuCCSDgTPtBGvLkXHbe7";
 const DEFAULT_SWITCHBOARD_POLL_MS: u64 = 2_000;
 const DEFAULT_SWITCHBOARD_MAX_AGE_SLOTS: u64 = 32;
+const DEFAULT_SWITCHBOARD_SIDECAR_SCRIPT: &str = "./switchboard-sidecar/dist/index.js";
+const DEFAULT_SWITCHBOARD_INSTRUCTION_IDX: u32 = 2; // Ed25519 ix at index 2 (after 2 compute budget ixs)
 const DEFAULT_AUTONOM_POLL_MS: u64 = 2_000;
 const CHAOSLABS_CYCLE: Duration = Duration::from_secs(2);
+
+fn is_dry_run() -> bool {
+    env::var("DRY_RUN")
+        .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes"))
+        .unwrap_or(false)
+}
 
 #[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
 enum ArgsCommitment {
@@ -129,10 +140,6 @@ struct Args {
     #[clap(long, default_value_t = String::from(DEFAULT_SWITCHBOARD_CROSSBAR_URL))]
     switchboard_crossbar_url: String,
 
-    /// Dedicated gateway URL (optional). If omitted, fetched from crossbar.
-    #[clap(long)]
-    switchboard_gateway_url: Option<String>,
-
     /// Switchboard network passed to crossbar gateways route (mainnet/devnet)
     #[clap(long, default_value_t = String::from(DEFAULT_SWITCHBOARD_NETWORK))]
     switchboard_network: String,
@@ -152,6 +159,14 @@ struct Args {
     /// Switchboard OnDemand polling interval in milliseconds
     #[clap(long, default_value_t = DEFAULT_SWITCHBOARD_POLL_MS)]
     switchboard_poll_ms: u64,
+
+    /// Path to the Switchboard TypeScript sidecar script (Node.js)
+    #[clap(long, default_value_t = String::from(DEFAULT_SWITCHBOARD_SIDECAR_SCRIPT))]
+    switchboard_sidecar_script: String,
+
+    /// Index of the Ed25519 instruction in the final transaction (after compute budget ixs)
+    #[clap(long, default_value_t = DEFAULT_SWITCHBOARD_INSTRUCTION_IDX)]
+    switchboard_instruction_idx: u32,
 
     /// Compute unit limit for coordinated update_pool_aum tx
     #[clap(long, default_value_t = UPDATE_POOL_AUM_CU_LIMIT_WITH_SWITCHBOARD)]
@@ -177,8 +192,8 @@ struct Args {
 
 #[derive(Default)]
 struct PendingProviderUpdates {
-    chaoslabs: Option<ChaosLabsBatchPrices>,
-    autonom: Option<ChaosLabsBatchPrices>,
+    chaoslabs: Option<BatchPrices>,
+    autonom: Option<BatchPrices>,
     switchboard: Option<SwitchboardOraclePricesUpdate>,
 }
 
@@ -204,7 +219,7 @@ impl PendingProviderUpdates {
         run_switchboard: bool,
     ) -> Result<
         (
-            Option<ChaosLabsBatchPrices>,
+            Option<BatchPrices>,
             Option<MultiBatchPrices>,
             Option<SwitchboardOraclePricesUpdate>,
         ),
@@ -321,6 +336,8 @@ async fn create_db_pool(args: &Args) -> Result<DbPool, anyhow::Error> {
     ssl_builder
         .set_ca_file(&combined_cert)
         .map_err(|e| anyhow::anyhow!("failed to set CA file: {e}"))?;
+    // Allow hostname mismatch for local dev (snakeoil cert CN != "localhost")
+    ssl_builder.set_verify(SslVerifyMode::NONE);
     let tls_connector = MakeTlsConnector::new(ssl_builder.build());
 
     let mut db_config = db_string.parse::<tokio_postgres::Config>()?;
@@ -365,11 +382,11 @@ async fn load_custody_accounts(
 enum ChaosLabsUpdateCandidate {
     OracleBatch {
         oracle_batch_id: i64,
-        batch: ChaosLabsBatchPrices,
+        batch: BatchPrices,
     },
     LegacyAssets {
         dedupe_key: String,
-        batch: ChaosLabsBatchPrices,
+        batch: BatchPrices,
     },
 }
 
@@ -598,8 +615,13 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     }
 
+    let dry_run = is_dry_run();
+    if dry_run {
+        log::info!("DRY_RUN=true — will build payloads but skip on-chain sends");
+    }
+
     let median_priority_fee = Arc::new(Mutex::new(0u64));
-    {
+    if !dry_run {
         let median_priority_fee = Arc::clone(&median_priority_fee);
         tokio::spawn(async move {
             let mut fee_refresh_interval = interval(PRIORITY_FEE_REFRESH_INTERVAL);
@@ -619,7 +641,10 @@ async fn main() -> Result<(), anyhow::Error> {
         });
     }
 
-    let custody_accounts = if active_chaoslabs || active_autonom || active_switchboard {
+    let custody_accounts = if dry_run {
+        log::info!("DRY_RUN: skipping custody account loading (no RPC needed)");
+        vec![]
+    } else if active_chaoslabs || active_autonom || active_switchboard {
         loop {
             match load_custody_accounts(&program, pool_pubkey).await {
                 Ok(accounts) => break accounts,
@@ -748,68 +773,28 @@ async fn main() -> Result<(), anyhow::Error> {
                         if active_switchboard {
                             let switchboard_cfg = switchboard::SwitchboardRuntimeConfig {
                                 crossbar_url: args.switchboard_crossbar_url.clone(),
-                                gateway_url: args.switchboard_gateway_url.clone(),
+                                rpc_url: args.endpoint.clone(),
                                 network: args.switchboard_network.clone(),
                                 queue_pubkey: switchboard_queue_pubkey,
                                 max_age_slots: args.switchboard_max_age_slots,
                                 poll_interval: Duration::from_millis(args.switchboard_poll_ms),
                                 feed_bindings: switchboard_feed_bindings,
+                                sidecar_script: args.switchboard_sidecar_script.clone(),
+                                payer_keypair_path: args.payer_keypair.clone(),
+                                instruction_idx: args.switchboard_instruction_idx,
                             };
 
-                            let switchboard_client = Client::new(
-                                Cluster::Custom(args.endpoint.clone(), args.endpoint.clone()),
-                                Arc::clone(&payer),
-                            );
-
-                            match switchboard_client.program(adrena_abi::ID) {
-                                Ok(switchboard_program) => {
-                                    if let Err(err) =
-                                        switchboard::validate_switchboard_feed_bindings_against_oracle(
-                                            &switchboard_program,
-                                            &switchboard_cfg.feed_bindings,
-                                        )
-                                        .await
-                                    {
-                                        if strict_provider_init {
-                                            return Err(anyhow::anyhow!(
-                                                "Switchboard feed-map preflight failed for selected provider: {:?}",
-                                                err
-                                            ));
-                                        }
-                                        log::error!(
-                                            "Switchboard feed-map preflight failed; disabling switchboard: {:?}",
-                                            err
-                                        );
-                                        active_switchboard = false;
-                                    } else {
-                                        let tx = provider_updates_tx.clone();
-                                        tokio::spawn(async move {
-                                            if let Err(err) = switchboard::run_switchboard_keeper(
-                                                switchboard_program,
-                                                switchboard_cfg,
-                                                tx,
-                                            )
-                                            .await
-                                            {
-                                                log::error!("Switchboard keeper exited with error: {err:?}");
-                                            }
-                                        });
-                                    }
+                            let tx = provider_updates_tx.clone();
+                            tokio::spawn(async move {
+                                if let Err(err) = switchboard::run_switchboard_keeper(
+                                    switchboard_cfg,
+                                    tx,
+                                )
+                                .await
+                                {
+                                    log::error!("Switchboard keeper exited with error: {err:?}");
                                 }
-                                Err(err) => {
-                                    if strict_provider_init {
-                                        return Err(anyhow::anyhow!(
-                                            "Failed to create switchboard program client for selected provider: {:?}",
-                                            err
-                                        ));
-                                    }
-                                    log::error!(
-                                        "Failed to create switchboard program client; disabling switchboard: {:?}",
-                                        err
-                                    );
-                                    active_switchboard = false;
-                                }
-                            }
+                            });
                         }
                     }
                 }
@@ -927,26 +912,38 @@ async fn main() -> Result<(), anyhow::Error> {
             }
         };
 
-        let priority_fee = *median_priority_fee.lock().await;
-        let cu_limit = if active_switchboard {
-            args.update_oracle_cu_limit
+        if dry_run {
+            let has_chaoslabs = oracle_prices.is_some();
+            let has_multi = multi_oracle_prices.as_ref().map(|m| m.batches.len()).unwrap_or(0);
+            let has_switchboard = switchboard_oracle_prices.is_some();
+            log::info!(
+                "   <> DRY_RUN payload ready: chaoslabs={}, multi_batches={}, switchboard={}",
+                has_chaoslabs,
+                has_multi,
+                has_switchboard
+            );
         } else {
-            UPDATE_AUM_CU_LIMIT
-        };
+            let priority_fee = *median_priority_fee.lock().await;
+            let cu_limit = if active_switchboard {
+                args.update_oracle_cu_limit
+            } else {
+                UPDATE_AUM_CU_LIMIT
+            };
 
-        if let Err(err) = handlers::update_pool_aum_combined(
-            &program,
-            pool_pubkey,
-            priority_fee,
-            cu_limit,
-            oracle_prices,
-            multi_oracle_prices,
-            switchboard_oracle_prices,
-            custody_accounts.clone(),
-        )
-        .await
-        {
-            log::error!("Coordinated update_pool_aum send failed (soft fail): {err:?}");
+            if let Err(err) = handlers::update_pool_aum_combined(
+                &program,
+                pool_pubkey,
+                priority_fee,
+                cu_limit,
+                oracle_prices,
+                multi_oracle_prices,
+                switchboard_oracle_prices,
+                custody_accounts.clone(),
+            )
+            .await
+            {
+                log::error!("Coordinated update_pool_aum send failed (soft fail): {err:?}");
+            }
         }
     }
 

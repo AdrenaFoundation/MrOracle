@@ -4,9 +4,8 @@ use {
         handlers::{create_update_oracle_multi_ix, create_update_oracle_switchboard_ix},
         provider_updates::SwitchboardOraclePricesUpdate,
     },
-    adrena_abi::oracle::ChaosLabsBatchPrices,
+    adrena_abi::oracle::BatchPrices,
     anchor_client::Program,
-    anyhow::Context,
     solana_client::rpc_config::RpcSendTransactionConfig,
     solana_sdk::{
         compute_budget::ComputeBudgetInstruction, instruction::Instruction, pubkey::Pubkey,
@@ -21,7 +20,7 @@ pub async fn update_oracle_with_multi_batch(
     median_priority_fee: u64,
     update_oracle_cu_limit: u32,
     provider: u8,
-    batch: ChaosLabsBatchPrices,
+    batch: BatchPrices,
 ) -> Result<(), anyhow::Error> {
     let multi_oracle_prices = MultiBatchPrices {
         batches: vec![BatchPricesWithProvider { provider, batch }],
@@ -49,17 +48,14 @@ pub async fn update_oracle_with_switchboard(
         ComputeBudgetInstruction::set_compute_unit_limit(update_oracle_cu_limit),
     ];
 
-    // Append secp256k1 verification instruction.
-    ixs.push(switchboard_update.secp_ix);
+    // Append Ed25519 signature verification instruction.
+    ixs.push(switchboard_update.ed25519_ix);
 
-    // Append PullFeedSubmitResponseConsensus instruction and record its index.
-    let submit_ix_index = u8::try_from(ixs.len())
-        .context("submit instruction index exceeds u8")?;
-    ixs.push(switchboard_update.submit_ix);
+    // Append quote program store instruction.
+    ixs.push(switchboard_update.quote_store_ix);
 
     let update_oracle_ix = create_update_oracle_switchboard_ix(
-        &switchboard_update.pull_feed_pubkeys,
-        submit_ix_index,
+        switchboard_update.quote_account,
         switchboard_update.max_age_slots,
         switchboard_update.feed_map,
     )?;

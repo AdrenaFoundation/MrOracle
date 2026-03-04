@@ -1,0 +1,22 @@
+{
+  "name": "switchboard-sidecar",
+  "version": "1.0.0",
+  "description": "Switchboard managed update sidecar for MrOracle — calls fetchManagedUpdateIxs and outputs serialized instructions via stdout",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "npx ts-node src/index.ts"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.31.1",
+    "@solana/web3.js": "^1.98.0",
+    "@switchboard-xyz/common": "^5.3.1",
+    "@switchboard-xyz/on-demand": "^3.7.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "ts-node": "^10.9.2",
+    "typescript": "^4.9.5"
+  }
+}
