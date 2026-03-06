@@ -1,32 +1,26 @@
 use {
-    crate::{db::OracleBatch, provider_updates::ProviderUpdate},
+    crate::{
+        db::{self, OracleBatch},
+        oracle_poller::PollerPayload,
+        provider_updates::ProviderUpdate,
+    },
     adrena_abi::oracle::{BatchPrices, PriceData},
-    anchor_client::Program,
     anyhow::Context,
     deadpool_postgres::Pool as DbPool,
     rust_decimal::prelude::ToPrimitive,
     serde::Deserialize,
-    solana_sdk::signature::Keypair,
     std::{
         collections::{HashMap, HashSet},
         fs,
-        sync::Arc,
-        time::Duration,
+        future::Future,
+        pin::Pin,
     },
-    tokio::sync::mpsc,
 };
 
 const AUTONOM_PROVIDER: &str = "autonom";
 const AUTONOM_MIN_FEED_ID: u8 = 30;
 const AUTONOM_MAX_FEED_ID: u8 = 141;
 
-
-#[derive(Debug, Clone)]
-pub struct AutonomRuntimeConfig {
-    pub db_pool: DbPool,
-    pub feed_map_path: String,
-    pub poll_interval: Duration,
-}
 
 #[derive(Debug, Clone)]
 struct AutonomAliasMapping {
@@ -49,14 +43,17 @@ enum AutonomFeedMapFile {
     },
 }
 
-pub async fn run_autonom_keeper(
-    program: Program<Arc<Keypair>>,
-    config: AutonomRuntimeConfig,
-    update_sender: mpsc::Sender<ProviderUpdate>,
-) -> Result<(), anyhow::Error> {
-    let alias_mapping = load_feed_map(&config.feed_map_path)?;
+pub fn make_autonom_cycle(
+    db_pool: DbPool,
+    feed_map_path: &str,
+) -> Result<
+    impl Fn() -> Pin<Box<dyn Future<Output = Result<Option<PollerPayload>, anyhow::Error>> + Send>>
+        + Send
+        + Sync,
+    anyhow::Error,
+> {
+    let alias_mapping = load_feed_map(feed_map_path)?;
 
-    // Derive required feed IDs from the config file (source of truth)
     let mut required_alias_feed_ids: Vec<u8> = alias_mapping
         .alias_by_canonical
         .values()
@@ -65,72 +62,31 @@ pub async fn run_autonom_keeper(
     required_alias_feed_ids.sort_unstable();
 
     log::info!(
-        "Autonom keeper: required alias feed_ids from config: {:?}",
+        "Autonom: required alias feed_ids from config: {:?}",
         required_alias_feed_ids
     );
 
-    let mut last_emitted_batch_id: Option<i64> = None;
+    Ok(move || -> Pin<Box<dyn Future<Output = Result<Option<PollerPayload>, anyhow::Error>> + Send>> {
+        let db_pool = db_pool.clone();
+        let alias_mapping = alias_mapping.clone();
+        let required = required_alias_feed_ids.clone();
+        Box::pin(async move {
+            let batch =
+                match db::get_latest_oracle_batch_by_provider(&db_pool, AUTONOM_PROVIDER).await? {
+                    Some(b) => b,
+                    None => return Ok(None),
+                };
 
-    loop {
-        if let Err(err) = run_autonom_cycle(
-            &program,
-            &config,
-            &alias_mapping,
-            &update_sender,
-            &mut last_emitted_batch_id,
-            &required_alias_feed_ids,
-        )
-        .await
-        {
-            log::error!("Autonom cycle failed: {:?}", err);
-        }
+            let batch_id = batch.oracle_batch_id;
+            let result =
+                build_autonom_batch_prices_from_db(batch, &required, &alias_mapping)?;
 
-        tokio::time::sleep(config.poll_interval).await;
-    }
-}
-
-async fn run_autonom_cycle(
-    _program: &Program<Arc<Keypair>>,
-    config: &AutonomRuntimeConfig,
-    alias_mapping: &AutonomAliasMapping,
-    update_sender: &mpsc::Sender<ProviderUpdate>,
-    last_emitted_batch_id: &mut Option<i64>,
-    required_alias_feed_ids: &[u8],
-) -> Result<(), anyhow::Error> {
-
-    let db_batch = match fetch_latest_autonom_batch_from_db(&config.db_pool).await? {
-        Some(batch) => batch,
-        None => {
-            log::warn!("No autonom batch found in DB; skipping cycle");
-            return Ok(());
-        }
-    };
-
-    if *last_emitted_batch_id == Some(db_batch.oracle_batch_id) {
-        log::debug!(
-            "Skipping autonom batch {} (already emitted)",
-            db_batch.oracle_batch_id
-        );
-        return Ok(());
-    }
-
-    let current_batch_id = db_batch.oracle_batch_id;
-    let batch =
-        build_autonom_batch_prices_from_db(db_batch, &required_alias_feed_ids, alias_mapping)?;
-
-    update_sender
-        .send(ProviderUpdate::Autonom(batch))
-        .await
-        .map_err(|_| anyhow::anyhow!("autonom provider update channel closed"))?;
-    *last_emitted_batch_id = Some(current_batch_id);
-
-    Ok(())
-}
-
-async fn fetch_latest_autonom_batch_from_db(
-    db_pool: &DbPool,
-) -> Result<Option<OracleBatch>, anyhow::Error> {
-    crate::db::get_latest_oracle_batch_by_provider(db_pool, AUTONOM_PROVIDER).await
+            Ok(Some(PollerPayload {
+                dedup_key: batch_id.to_string(),
+                update: ProviderUpdate::Autonom(result),
+            }))
+        })
+    })
 }
 
 fn build_autonom_batch_prices_from_db(
@@ -145,6 +101,8 @@ fn build_autonom_batch_prices_from_db(
             db_batch.oracle_batch_id
         ));
     }
+
+    let (signature, recovery_id) = db_batch.decode_signature()?;
 
     // CRITICAL: Preserve the DB insertion order (oracle_batch_price_id ASC).
     // The API signs the batch in its response order. The on-chain
@@ -216,34 +174,6 @@ fn build_autonom_batch_prices_from_db(
             missing
         ));
     }
-
-    let signature_hex = db_batch
-        .signature
-        .as_deref()
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "autonom DB batch {} has no signature",
-                db_batch.oracle_batch_id
-            )
-        })?
-        .trim_start_matches("0x");
-    let signature_bytes =
-        hex::decode(signature_hex).context("failed to decode autonom signature hex")?;
-    let signature: [u8; 64] = signature_bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("autonom signature must be 64 bytes"))?;
-
-    let recovery_id = db_batch
-        .recovery_id
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "autonom DB batch {} has no recovery_id",
-                db_batch.oracle_batch_id
-            )
-        })
-        .and_then(|id| {
-            u8::try_from(id).map_err(|_| anyhow::anyhow!("invalid autonom recovery_id {}", id))
-        })?;
 
     // Build prices in DB insertion order (preserved via insertion_order vec)
     let prices: Vec<PriceData> = insertion_order

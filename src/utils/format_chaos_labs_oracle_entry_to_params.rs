@@ -221,23 +221,7 @@ pub fn format_chaos_labs_oracle_batch_to_params(
         ));
     }
 
-    let signature_hex = oracle_batch
-        .signature
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("chaoslabs DB batch has no signature"))?
-        .trim_start_matches("0x");
-    let signature_bytes =
-        hex::decode(signature_hex).context("failed to decode chaoslabs signature hex")?;
-    let signature_vec: [u8; 64] = signature_bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("chaoslabs signature must be 64 bytes"))?;
-
-    let recovery_id = oracle_batch
-        .recovery_id
-        .ok_or_else(|| anyhow::anyhow!("chaoslabs DB batch has no recovery_id"))
-        .and_then(|id| {
-            u8::try_from(id).map_err(|_| anyhow::anyhow!("invalid chaoslabs recovery_id {}", id))
-        })?;
+    let (signature_vec, recovery_id) = oracle_batch.decode_signature()?;
 
     // Build a set of expected feed IDs from the feed map for validation.
     let expected_feed_ids: HashSet<u8> = feed_bindings.iter().map(|b| b.adrena_feed_id).collect();

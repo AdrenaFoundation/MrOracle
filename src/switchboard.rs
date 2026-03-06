@@ -1,21 +1,19 @@
 use {
     crate::{
         adrena_ix::SwitchboardFeedMapEntry,
+        db,
+        oracle_poller::PollerPayload,
         provider_updates::{ProviderUpdate, SwitchboardOraclePricesUpdate},
     },
     anyhow::Context,
     base64::{engine::general_purpose::STANDARD as BASE64, Engine},
-    serde::Deserialize,
+    deadpool_postgres::Pool as DbPool,
+    serde::{Deserialize, Serialize},
     solana_sdk::{
         instruction::{AccountMeta, Instruction},
         pubkey::Pubkey,
     },
-    std::{collections::HashSet, fs, process::Stdio, str::FromStr, time::Duration},
-    tokio::{
-        io::AsyncBufReadExt,
-        process::Command,
-        sync::mpsc,
-    },
+    std::{collections::HashSet, fs, future::Future, pin::Pin, str::FromStr, time::Duration},
 };
 
 const SWITCHBOARD_MIN_FEED_ID: u8 = 142;
@@ -39,44 +37,39 @@ impl SwitchboardFeedBinding {
 
 #[derive(Debug, Clone)]
 pub struct SwitchboardRuntimeConfig {
-    pub crossbar_url: String,
-    pub rpc_url: String,
-    pub network: String,
     pub queue_pubkey: Pubkey,
     pub max_age_slots: u64,
     pub poll_interval: Duration,
     pub feed_bindings: Vec<SwitchboardFeedBinding>,
-    pub sidecar_script: String,
-    pub payer_keypair_path: String,
     pub instruction_idx: u32,
 }
 
 // ---------------------------------------------------------------------------
-// JSON deserialization for sidecar output (matches TypeScript SidecarOutput)
+// JSON deserialization for DB JSONB columns (matches adrena-data SerializedInstruction)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
-struct SidecarAccountMeta {
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct SidecarAccountMeta {
     pubkey: String,
     is_signer: bool,
     is_writable: bool,
 }
 
-#[derive(Debug, Deserialize)]
-struct SidecarInstruction {
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct SidecarInstruction {
     program_id: String,
     accounts: Vec<SidecarAccountMeta>,
     data: String, // base64-encoded
 }
 
-#[derive(Debug, Deserialize)]
-struct SidecarOutput {
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct SidecarOutput {
     ed25519_ix: SidecarInstruction,
     quote_store_ix: SidecarInstruction,
     quote_account: String, // base58-encoded pubkey
 }
 
-fn deserialize_instruction(raw: SidecarInstruction) -> Result<Instruction, anyhow::Error> {
+pub(crate) fn deserialize_instruction(raw: SidecarInstruction) -> Result<Instruction, anyhow::Error> {
     let program_id = Pubkey::from_str(&raw.program_id)
         .with_context(|| format!("invalid instruction program_id: {}", raw.program_id))?;
 
@@ -212,116 +205,54 @@ pub fn load_switchboard_feed_bindings(
 }
 
 // ---------------------------------------------------------------------------
-// Switchboard keeper — spawns TypeScript sidecar, reads JSON lines from stdout
+// Switchboard cycle function for generic poller
 // ---------------------------------------------------------------------------
 
-/// Run the Switchboard keeper by spawning the TypeScript sidecar process.
-///
-/// The sidecar calls `fetchManagedUpdateIxs` (from `@switchboard-xyz/on-demand`)
-/// and writes serialized instructions as JSON lines to stdout. This function
-/// reads those lines, deserializes the instructions, and forwards them as
-/// `ProviderUpdate::Switchboard` to the coordinated update loop.
-pub async fn run_switchboard_keeper(
+pub fn make_switchboard_cycle(
+    db_pool: DbPool,
     config: SwitchboardRuntimeConfig,
-    update_sender: mpsc::Sender<ProviderUpdate>,
-) -> Result<(), anyhow::Error> {
-    let feed_hashes_csv: String = config
-        .feed_bindings
-        .iter()
-        .map(|b| b.switchboard_feed_hash_hex.clone())
-        .collect::<Vec<_>>()
-        .join(",");
-
-    let switchboard_feed_map: Vec<SwitchboardFeedMapEntry> = config
+) -> impl Fn() -> Pin<Box<dyn Future<Output = Result<Option<PollerPayload>, anyhow::Error>> + Send>>
+       + Send
+       + Sync {
+    let feed_map: Vec<SwitchboardFeedMapEntry> = config
         .feed_bindings
         .iter()
         .map(SwitchboardFeedBinding::to_feed_map_entry)
         .collect();
 
-    log::info!(
-        "Spawning Switchboard sidecar: script={}, feeds={}, instruction_idx={}",
-        config.sidecar_script,
-        config.feed_bindings.len(),
-        config.instruction_idx,
-    );
+    move || {
+        let db_pool = db_pool.clone();
+        let config = config.clone();
+        let feed_map = feed_map.clone();
+        Box::pin(async move {
+            let batch =
+                match db::get_latest_oracle_batch_by_provider(&db_pool, "switchboard").await? {
+                    Some(b) => b,
+                    None => return Ok(None),
+                };
 
-    let mut child = Command::new("node")
-        .arg(&config.sidecar_script)
-        .env("SWITCHBOARD_RPC_URL", &config.rpc_url)
-        .env("SWITCHBOARD_PAYER_KEYPAIR_PATH", &config.payer_keypair_path)
-        .env("SWITCHBOARD_CROSSBAR_URL", &config.crossbar_url)
-        .env("SWITCHBOARD_QUEUE_PUBKEY", config.queue_pubkey.to_string())
-        .env("SWITCHBOARD_FEED_HASHES", &feed_hashes_csv)
-        .env(
-            "SWITCHBOARD_POLL_MS",
-            config.poll_interval.as_millis().to_string(),
-        )
-        .env(
-            "SWITCHBOARD_INSTRUCTION_IDX",
-            config.instruction_idx.to_string(),
-        )
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit()) // Forward sidecar logs to MrOracle's stderr
-        .spawn()
-        .with_context(|| format!("failed to spawn sidecar: node {}", config.sidecar_script))?;
+            let batch_id = batch.oracle_batch_id;
+            let metadata = batch.metadata.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "switchboard oracle_batch {} has no metadata",
+                    batch_id
+                )
+            })?;
 
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("failed to capture sidecar stdout"))?;
+            let output: SidecarOutput = serde_json::from_value(metadata)
+                .context("failed to deserialize switchboard metadata as SidecarOutput")?;
 
-    let mut reader = tokio::io::BufReader::new(stdout);
-    let mut line = String::new();
+            let update = build_update_from_sidecar(output, &config, &feed_map)?;
 
-    loop {
-        line.clear();
-        let bytes_read = reader
-            .read_line(&mut line)
-            .await
-            .context("failed to read from sidecar stdout")?;
-
-        if bytes_read == 0 {
-            // Sidecar exited — stdout closed
-            let status = child.wait().await?;
-            return Err(anyhow::anyhow!(
-                "switchboard sidecar exited with status: {}",
-                status
-            ));
-        }
-
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        match serde_json::from_str::<SidecarOutput>(trimmed) {
-            Ok(output) => {
-                match build_update_from_sidecar(output, &config, &switchboard_feed_map) {
-                    Ok(update) => {
-                        update_sender
-                            .send(ProviderUpdate::Switchboard(update))
-                            .await
-                            .map_err(|_| {
-                                anyhow::anyhow!("switchboard provider update channel closed")
-                            })?;
-                    }
-                    Err(err) => {
-                        log::error!("Switchboard sidecar output deserialization failed: {:?}", err);
-                    }
-                }
-            }
-            Err(err) => {
-                log::error!(
-                    "Failed to parse sidecar JSON line: {:?} (line: {})",
-                    err,
-                    trimmed
-                );
-            }
-        }
+            Ok(Some(PollerPayload {
+                dedup_key: batch_id.to_string(),
+                update: ProviderUpdate::Switchboard(update),
+            }))
+        })
     }
 }
 
-fn build_update_from_sidecar(
+pub(crate) fn build_update_from_sidecar(
     output: SidecarOutput,
     config: &SwitchboardRuntimeConfig,
     switchboard_feed_map: &[SwitchboardFeedMapEntry],

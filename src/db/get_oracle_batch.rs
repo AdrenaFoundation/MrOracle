@@ -1,3 +1,4 @@
+use anyhow::Context;
 use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool as DbPool;
 use rust_decimal::Decimal;
@@ -20,6 +21,61 @@ pub struct OracleBatch {
     pub recovery_id: Option<i32>,
     pub latest_timestamp: DateTime<Utc>,
     pub prices: Vec<OracleBatchPrice>,
+    pub metadata: Option<serde_json::Value>,
+}
+
+impl OracleBatch {
+    /// Decode hex signature + recovery_id from a signed batch (ChaosLabs/Autonom).
+    pub fn decode_signature(&self) -> Result<([u8; 64], u8), anyhow::Error> {
+        let signature_hex = self
+            .signature
+            .as_deref()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} DB batch {} has no signature",
+                    self.provider,
+                    self.oracle_batch_id
+                )
+            })?
+            .trim_start_matches("0x");
+
+        let signature_bytes = hex::decode(signature_hex).with_context(|| {
+            format!(
+                "failed to decode {} signature hex for batch {}",
+                self.provider, self.oracle_batch_id
+            )
+        })?;
+
+        let signature: [u8; 64] = signature_bytes.try_into().map_err(|_| {
+            anyhow::anyhow!(
+                "{} signature must be 64 bytes for batch {}",
+                self.provider,
+                self.oracle_batch_id
+            )
+        })?;
+
+        let recovery_id = self
+            .recovery_id
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} DB batch {} has no recovery_id",
+                    self.provider,
+                    self.oracle_batch_id
+                )
+            })
+            .and_then(|id| {
+                u8::try_from(id).map_err(|_| {
+                    anyhow::anyhow!(
+                        "invalid {} recovery_id {} for batch {}",
+                        self.provider,
+                        id,
+                        self.oracle_batch_id
+                    )
+                })
+            })?;
+
+        Ok((signature, recovery_id))
+    }
 }
 
 pub async fn get_latest_oracle_batch_by_provider(
@@ -40,7 +96,8 @@ pub async fn get_latest_oracle_batch_by_provider(
                 provider,
                 signature,
                 recovery_id,
-                latest_timestamp
+                latest_timestamp,
+                metadata
             FROM oracle_batches
             WHERE provider = $1
             ORDER BY latest_timestamp DESC
@@ -59,6 +116,7 @@ pub async fn get_latest_oracle_batch_by_provider(
     let signature = header_row.get::<_, Option<String>>(2);
     let recovery_id = header_row.get::<_, Option<i32>>(3);
     let latest_timestamp = header_row.get::<_, DateTime<Utc>>(4);
+    let metadata = header_row.get::<_, Option<serde_json::Value>>(5);
 
     let price_rows = client
         .query(
@@ -96,5 +154,6 @@ pub async fn get_latest_oracle_batch_by_provider(
         recovery_id,
         latest_timestamp,
         prices,
+        metadata,
     }))
 }

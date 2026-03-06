@@ -11,10 +11,10 @@ use {
     postgres_openssl::MakeTlsConnector,
     priority_fees::fetch_mean_priority_fee,
     solana_sdk::{instruction::AccountMeta, pubkey::Pubkey},
-    std::{env, str::FromStr, sync::Arc, time::Duration},
+    std::{env, future::Future, pin::Pin, str::FromStr, sync::Arc, time::Duration},
     tokio::{
         sync::{mpsc, Mutex},
-        time::{interval, Instant},
+        time::interval,
     },
 };
 
@@ -22,6 +22,7 @@ pub mod adrena_ix;
 pub mod autonom;
 pub mod db;
 pub mod handlers;
+pub mod oracle_poller;
 pub mod priority_fees;
 pub mod provider_updates;
 pub mod switchboard;
@@ -48,15 +49,10 @@ const PRIORITY_FEE_REFRESH_INTERVAL: Duration = Duration::from_secs(5); // secon
 const UPDATE_AUM_CU_LIMIT: u32 = 120_000;
 const UPDATE_POOL_AUM_CU_LIMIT_WITH_SWITCHBOARD: u32 = 1_400_000;
 
-const DEFAULT_SWITCHBOARD_CROSSBAR_URL: &str = "https://crossbar.switchboard.xyz";
-const DEFAULT_SWITCHBOARD_NETWORK: &str = "mainnet";
 const DEFAULT_SWITCHBOARD_MAINNET_QUEUE_PUBKEY: &str =
     "A43DyUGA7s8eXPxqEjJY6EBu1KKbNgfxF8h17VAHn13w";
-const DEFAULT_SWITCHBOARD_DEVNET_QUEUE_PUBKEY: &str =
-    "EYiAmGSdsQTuCw413V5BzaruWuCCSDgTPtBGvLkXHbe7";
 const DEFAULT_SWITCHBOARD_POLL_MS: u64 = 2_000;
 const DEFAULT_SWITCHBOARD_MAX_AGE_SLOTS: u64 = 32;
-const DEFAULT_SWITCHBOARD_SIDECAR_SCRIPT: &str = "./switchboard-sidecar/dist/index.js";
 const DEFAULT_SWITCHBOARD_INSTRUCTION_IDX: u32 = 2; // Ed25519 ix at index 2 (after 2 compute budget ixs)
 const DEFAULT_AUTONOM_POLL_MS: u64 = 2_000;
 const CHAOSLABS_CYCLE: Duration = Duration::from_secs(2);
@@ -136,14 +132,6 @@ struct Args {
     #[clap(long)]
     chaoslabs_feed_map_path: Option<String>,
 
-    /// Crossbar base URL
-    #[clap(long, default_value_t = String::from(DEFAULT_SWITCHBOARD_CROSSBAR_URL))]
-    switchboard_crossbar_url: String,
-
-    /// Switchboard network passed to crossbar gateways route (mainnet/devnet)
-    #[clap(long, default_value_t = String::from(DEFAULT_SWITCHBOARD_NETWORK))]
-    switchboard_network: String,
-
     /// Switchboard queue pubkey
     #[clap(long, default_value_t = String::from(DEFAULT_SWITCHBOARD_MAINNET_QUEUE_PUBKEY))]
     switchboard_queue_pubkey: String,
@@ -159,10 +147,6 @@ struct Args {
     /// Switchboard OnDemand polling interval in milliseconds
     #[clap(long, default_value_t = DEFAULT_SWITCHBOARD_POLL_MS)]
     switchboard_poll_ms: u64,
-
-    /// Path to the Switchboard TypeScript sidecar script (Node.js)
-    #[clap(long, default_value_t = String::from(DEFAULT_SWITCHBOARD_SIDECAR_SCRIPT))]
-    switchboard_sidecar_script: String,
 
     /// Index of the Ed25519 instruction in the final transaction (after compute budget ixs)
     #[clap(long, default_value_t = DEFAULT_SWITCHBOARD_INSTRUCTION_IDX)]
@@ -379,127 +363,82 @@ async fn load_custody_accounts(
     Ok(out)
 }
 
-enum ChaosLabsUpdateCandidate {
-    OracleBatch {
-        oracle_batch_id: i64,
-        batch: BatchPrices,
-    },
-    LegacyAssets {
-        dedupe_key: String,
-        batch: BatchPrices,
-    },
-}
-
-async fn fetch_chaoslabs_batch_from_db(
-    db_pool: &DbPool,
-    feed_bindings: &[ChaosLabsFeedBinding],
-) -> Result<ChaosLabsUpdateCandidate, anyhow::Error> {
-    match db::get_latest_oracle_batch_by_provider(db_pool, "chaoslabs").await {
-        Ok(Some(batch)) => {
-            let oracle_batch_id = batch.oracle_batch_id;
-            let batch = format_chaos_labs_oracle_batch_to_params(&batch, feed_bindings)?;
-            Ok(ChaosLabsUpdateCandidate::OracleBatch {
-                oracle_batch_id,
-                batch,
-            })
-        }
-        Ok(None) => {
-            log::warn!(
-                "No chaoslabs batch found in oracle_batches, falling back to legacy assets_price"
-            );
-            match db::get_assets_prices::get_assets_prices(db_pool).await {
-                Ok(Some(assets_prices)) => {
-                    let dedupe_key = format!(
-                        "{}:{}",
-                        assets_prices.signature,
-                        assets_prices.latest_timestamp.timestamp_millis()
-                    );
-                    let batch = format_chaos_labs_oracle_entry_to_params(&assets_prices, feed_bindings)?;
-                    Ok(ChaosLabsUpdateCandidate::LegacyAssets { dedupe_key, batch })
-                }
-                Ok(None) => Err(anyhow::anyhow!(
-                    "No chaoslabs price entry found in oracle_batches or legacy assets_price"
-                )),
-                Err(e) => Err(anyhow::anyhow!(
-                    "Legacy assets_price fallback query failed: {e:?}"
-                )),
-            }
-        }
-        Err(e) => {
-            log::warn!(
-                "Failed querying oracle_batches for chaoslabs ({e:?}); trying legacy assets_price fallback"
-            );
-            match db::get_assets_prices::get_assets_prices(db_pool).await {
-                Ok(Some(assets_prices)) => {
-                    let dedupe_key = format!(
-                        "{}:{}",
-                        assets_prices.signature,
-                        assets_prices.latest_timestamp.timestamp_millis()
-                    );
-                    let batch = format_chaos_labs_oracle_entry_to_params(&assets_prices, feed_bindings)?;
-                    Ok(ChaosLabsUpdateCandidate::LegacyAssets { dedupe_key, batch })
-                }
-                Ok(None) => Err(anyhow::anyhow!(
-                    "No chaoslabs price entry found in legacy assets_price fallback"
-                )),
-                Err(legacy_e) => Err(anyhow::anyhow!(
-                    "Legacy assets_price fallback query failed: {legacy_e:?}"
-                )),
-            }
-        }
-    }
-}
-
-async fn run_chaoslabs_keeper(
+fn make_chaoslabs_cycle(
     db_pool: DbPool,
     feed_bindings: Vec<ChaosLabsFeedBinding>,
-    update_sender: mpsc::Sender<ProviderUpdate>,
-) -> Result<(), anyhow::Error> {
-    let mut last_oracle_batch_id: Option<i64> = None;
-    let mut last_legacy_dedupe_key: Option<String> = None;
-
-    loop {
-        let start = Instant::now();
-
-        match fetch_chaoslabs_batch_from_db(&db_pool, &feed_bindings).await {
-            Ok(ChaosLabsUpdateCandidate::OracleBatch {
-                oracle_batch_id,
-                batch,
-            }) => {
-                if last_oracle_batch_id == Some(oracle_batch_id) {
-                    log::debug!(
-                        "Skipping chaoslabs batch {} (already emitted)",
-                        oracle_batch_id
+) -> impl Fn() -> Pin<Box<dyn Future<Output = Result<Option<oracle_poller::PollerPayload>, anyhow::Error>> + Send>>
+       + Send
+       + Sync {
+    move || {
+        let db_pool = db_pool.clone();
+        let feed_bindings = feed_bindings.clone();
+        Box::pin(async move {
+            match db::get_latest_oracle_batch_by_provider(&db_pool, "chaoslabs").await {
+                Ok(Some(batch)) => {
+                    let id = batch.oracle_batch_id;
+                    let result =
+                        format_chaos_labs_oracle_batch_to_params(&batch, &feed_bindings)?;
+                    Ok(Some(oracle_poller::PollerPayload {
+                        dedup_key: id.to_string(),
+                        update: ProviderUpdate::ChaosLabs(result),
+                    }))
+                }
+                Ok(None) => {
+                    log::warn!(
+                        "No chaoslabs batch in oracle_batches, trying legacy assets_price"
                     );
-                } else {
-                    update_sender
-                        .send(ProviderUpdate::ChaosLabs(batch))
-                        .await
-                        .map_err(|_| anyhow::anyhow!("chaoslabs provider update channel closed"))?;
-                    last_oracle_batch_id = Some(oracle_batch_id);
+                    match db::get_assets_prices::get_assets_prices(&db_pool).await {
+                        Ok(Some(assets)) => {
+                            let key = format!(
+                                "legacy:{}:{}",
+                                assets.signature,
+                                assets.latest_timestamp.timestamp_millis()
+                            );
+                            let batch = format_chaos_labs_oracle_entry_to_params(
+                                &assets,
+                                &feed_bindings,
+                            )?;
+                            Ok(Some(oracle_poller::PollerPayload {
+                                dedup_key: key,
+                                update: ProviderUpdate::ChaosLabs(batch),
+                            }))
+                        }
+                        Ok(None) => Ok(None),
+                        Err(e) => Err(anyhow::anyhow!(
+                            "legacy assets_price fallback failed: {e:?}"
+                        )),
+                    }
+                }
+                Err(e) => {
+                    log::warn!(
+                        "oracle_batches query failed ({e:?}); trying legacy fallback"
+                    );
+                    match db::get_assets_prices::get_assets_prices(&db_pool).await {
+                        Ok(Some(assets)) => {
+                            let key = format!(
+                                "legacy:{}:{}",
+                                assets.signature,
+                                assets.latest_timestamp.timestamp_millis()
+                            );
+                            let batch = format_chaos_labs_oracle_entry_to_params(
+                                &assets,
+                                &feed_bindings,
+                            )?;
+                            Ok(Some(oracle_poller::PollerPayload {
+                                dedup_key: key,
+                                update: ProviderUpdate::ChaosLabs(batch),
+                            }))
+                        }
+                        Ok(None) => Err(anyhow::anyhow!(
+                            "No chaoslabs data in either source"
+                        )),
+                        Err(le) => Err(anyhow::anyhow!(
+                            "Both sources failed: oracle_batches={e:?}, legacy={le:?}"
+                        )),
+                    }
                 }
             }
-            Ok(ChaosLabsUpdateCandidate::LegacyAssets { dedupe_key, batch }) => {
-                if last_legacy_dedupe_key.as_deref() == Some(dedupe_key.as_str()) {
-                    log::debug!("Skipping legacy chaoslabs fallback row (already emitted)");
-                } else {
-                    update_sender
-                        .send(ProviderUpdate::ChaosLabs(batch))
-                        .await
-                        .map_err(|_| anyhow::anyhow!("chaoslabs provider update channel closed"))?;
-                    last_legacy_dedupe_key = Some(dedupe_key);
-                }
-            }
-            Err(e) => {
-                log::error!("Error building chaoslabs payload from DB: {e:?}");
-            }
-        }
-
-        let elapsed = start.elapsed();
-        let sleep_duration = CHAOSLABS_CYCLE.saturating_sub(elapsed);
-        if sleep_duration > Duration::from_millis(0) {
-            tokio::time::sleep(sleep_duration).await;
-        }
+        })
     }
 }
 
@@ -551,7 +490,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .map_err(|e| anyhow::anyhow!("failed to get program: {e:?}"))?;
 
     let mut db_pool: Option<DbPool> = None;
-    if active_chaoslabs || active_autonom {
+    if active_chaoslabs || active_autonom || active_switchboard {
         match create_db_pool(&args).await {
             Ok(pool) => {
                 db_pool = Some(pool);
@@ -559,16 +498,17 @@ async fn main() -> Result<(), anyhow::Error> {
             Err(err) => {
                 if strict_provider_init {
                     return Err(anyhow::anyhow!(
-                        "DB pool init failed for selected DB-backed providers (chaoslabs/autonom): {:?}",
+                        "DB pool init failed for selected DB-backed providers (chaoslabs/autonom/switchboard): {:?}",
                         err
                     ));
                 }
                 log::error!(
-                    "DB pool init failed; disabling DB-backed providers (chaoslabs/autonom): {:?}",
+                    "DB pool init failed; disabling DB-backed providers (chaoslabs/autonom/switchboard): {:?}",
                     err
                 );
                 active_chaoslabs = false;
                 active_autonom = false;
+                active_switchboard = false;
             }
         }
     }
@@ -666,11 +606,13 @@ async fn main() -> Result<(), anyhow::Error> {
     if active_chaoslabs {
         match db_pool.clone() {
             Some(chaoslabs_db_pool) => {
-                let chaoslabs_feed_bindings = chaoslabs_feed_bindings.clone();
+                let cycle =
+                    make_chaoslabs_cycle(chaoslabs_db_pool, chaoslabs_feed_bindings.clone());
                 let tx = provider_updates_tx.clone();
                 tokio::spawn(async move {
                     if let Err(err) =
-                        run_chaoslabs_keeper(chaoslabs_db_pool, chaoslabs_feed_bindings, tx).await
+                        oracle_poller::run_provider_poller("chaoslabs", CHAOSLABS_CYCLE, cycle, tx)
+                            .await
                     {
                         log::error!("ChaosLabs keeper exited with error: {err:?}");
                     }
@@ -742,59 +684,49 @@ async fn main() -> Result<(), anyhow::Error> {
                     };
 
                     if active_switchboard {
-                        let expected_queue_for_network = if args
-                            .switchboard_network
-                            .to_ascii_lowercase()
-                            .contains("devnet")
-                        {
-                            Pubkey::from_str(DEFAULT_SWITCHBOARD_DEVNET_QUEUE_PUBKEY).unwrap()
-                        } else {
-                            Pubkey::from_str(DEFAULT_SWITCHBOARD_MAINNET_QUEUE_PUBKEY).unwrap()
-                        };
+                        match db_pool.clone() {
+                            Some(switchboard_db_pool) => {
+                                let poll_interval =
+                                    Duration::from_millis(args.switchboard_poll_ms);
+                                let switchboard_cfg = switchboard::SwitchboardRuntimeConfig {
+                                    queue_pubkey: switchboard_queue_pubkey,
+                                    max_age_slots: args.switchboard_max_age_slots,
+                                    poll_interval,
+                                    feed_bindings: switchboard_feed_bindings,
+                                    instruction_idx: args.switchboard_instruction_idx,
+                                };
 
-                        if switchboard_queue_pubkey != expected_queue_for_network {
-                            if strict_provider_init {
-                                return Err(anyhow::anyhow!(
-                                    "Switchboard queue pubkey {} does not match default queue {} for selected network `{}`",
-                                    switchboard_queue_pubkey,
-                                    expected_queue_for_network,
-                                    args.switchboard_network
-                                ));
-                            }
-                            log::error!(
-                                "Switchboard queue pubkey {} does not match default queue {} for network `{}`; disabling switchboard",
-                                switchboard_queue_pubkey,
-                                expected_queue_for_network,
-                                args.switchboard_network
-                            );
-                            active_switchboard = false;
-                        }
-
-                        if active_switchboard {
-                            let switchboard_cfg = switchboard::SwitchboardRuntimeConfig {
-                                crossbar_url: args.switchboard_crossbar_url.clone(),
-                                rpc_url: args.endpoint.clone(),
-                                network: args.switchboard_network.clone(),
-                                queue_pubkey: switchboard_queue_pubkey,
-                                max_age_slots: args.switchboard_max_age_slots,
-                                poll_interval: Duration::from_millis(args.switchboard_poll_ms),
-                                feed_bindings: switchboard_feed_bindings,
-                                sidecar_script: args.switchboard_sidecar_script.clone(),
-                                payer_keypair_path: args.payer_keypair.clone(),
-                                instruction_idx: args.switchboard_instruction_idx,
-                            };
-
-                            let tx = provider_updates_tx.clone();
-                            tokio::spawn(async move {
-                                if let Err(err) = switchboard::run_switchboard_keeper(
+                                let cycle = switchboard::make_switchboard_cycle(
+                                    switchboard_db_pool,
                                     switchboard_cfg,
-                                    tx,
-                                )
-                                .await
-                                {
-                                    log::error!("Switchboard keeper exited with error: {err:?}");
+                                );
+                                let tx = provider_updates_tx.clone();
+                                tokio::spawn(async move {
+                                    if let Err(err) = oracle_poller::run_provider_poller(
+                                        "switchboard",
+                                        poll_interval,
+                                        cycle,
+                                        tx,
+                                    )
+                                    .await
+                                    {
+                                        log::error!(
+                                            "Switchboard keeper exited with error: {err:?}"
+                                        );
+                                    }
+                                });
+                            }
+                            None => {
+                                if strict_provider_init {
+                                    return Err(anyhow::anyhow!(
+                                        "switchboard selected but DB pool unavailable"
+                                    ));
                                 }
-                            });
+                                log::error!(
+                                    "switchboard selected but DB pool unavailable; disabling"
+                                );
+                                active_switchboard = false;
+                            }
                         }
                     }
                 }
@@ -821,23 +753,18 @@ async fn main() -> Result<(), anyhow::Error> {
 
         match (db_pool.clone(), autonom_feed_map_path) {
             (Some(autonom_db_pool), Some(feed_map_path)) => {
-                let autonom_cfg = autonom::AutonomRuntimeConfig {
-                    db_pool: autonom_db_pool,
-                    feed_map_path: feed_map_path.clone(),
-                    poll_interval: Duration::from_millis(args.autonom_poll_ms),
-                };
-
-                let autonom_client = Client::new(
-                    Cluster::Custom(args.endpoint.clone(), args.endpoint.clone()),
-                    Arc::clone(&payer),
-                );
-
-                match autonom_client.program(adrena_abi::ID) {
-                    Ok(autonom_program) => {
+                match autonom::make_autonom_cycle(autonom_db_pool, &feed_map_path) {
+                    Ok(cycle) => {
                         let tx = provider_updates_tx.clone();
+                        let poll_interval = Duration::from_millis(args.autonom_poll_ms);
                         tokio::spawn(async move {
-                            if let Err(err) =
-                                autonom::run_autonom_keeper(autonom_program, autonom_cfg, tx).await
+                            if let Err(err) = oracle_poller::run_provider_poller(
+                                "autonom",
+                                poll_interval,
+                                cycle,
+                                tx,
+                            )
+                            .await
                             {
                                 log::error!("Autonom keeper exited with error: {err:?}");
                             }
@@ -846,12 +773,12 @@ async fn main() -> Result<(), anyhow::Error> {
                     Err(err) => {
                         if strict_provider_init {
                             return Err(anyhow::anyhow!(
-                                "Failed to create autonom program client for selected provider: {:?}",
+                                "Failed to initialize autonom cycle for selected provider: {:?}",
                                 err
                             ));
                         }
                         log::error!(
-                            "Failed to create autonom program client; disabling autonom: {:?}",
+                            "Failed to initialize autonom cycle; disabling autonom: {:?}",
                             err
                         );
                         active_autonom = false;
