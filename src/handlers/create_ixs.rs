@@ -1,5 +1,5 @@
 use {
-    crate::adrena_ix::{self, MultiBatchPrices, SwitchboardFeedMapEntry, SwitchboardUpdateParams},
+    crate::adrena_ix::{self, MultiBatchPrices, SwitchboardUpdateParams},
     adrena_abi::oracle::BatchPrices,
     solana_sdk::{
         instruction::{AccountMeta, Instruction},
@@ -25,22 +25,4 @@ pub fn create_update_pool_aum_ix(
         quote_account,
         custody_accounts,
     )
-}
-
-pub fn create_update_oracle_switchboard_ix(
-    quote_account: Pubkey,
-    max_age_slots: u64,
-    feed_map: Vec<SwitchboardFeedMapEntry>,
-) -> Result<Instruction, anyhow::Error> {
-    adrena_ix::build_update_oracle_switchboard_ix(
-        quote_account,
-        max_age_slots,
-        feed_map,
-    )
-}
-
-pub fn create_update_oracle_multi_ix(
-    multi_oracle_prices: MultiBatchPrices,
-) -> Result<Instruction, anyhow::Error> {
-    adrena_ix::build_update_oracle_multi_ix(multi_oracle_prices)
 }

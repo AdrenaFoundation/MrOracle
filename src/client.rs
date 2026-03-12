@@ -222,13 +222,29 @@ impl PendingProviderUpdates {
                 let chaoslabs = self.chaoslabs.take().ok_or_else(|| {
                     anyhow::anyhow!("missing chaoslabs payload for coordinated cycle")
                 })?;
-                Ok((Some(chaoslabs), None, switchboard_oracle_prices))
+                let multi_oracle_prices = MultiBatchPrices {
+                    batches: vec![BatchPricesWithProvider {
+                        provider: ORACLE_PROVIDER_CHAOS_LABS,
+                        batch: chaoslabs,
+                    }],
+                };
+                Ok((None, Some(multi_oracle_prices), switchboard_oracle_prices))
             }
             (false, true) => {
                 let autonom = self.autonom.take().ok_or_else(|| {
                     anyhow::anyhow!("missing autonom payload for coordinated cycle")
                 })?;
-                Ok((Some(autonom), None, switchboard_oracle_prices))
+                // IMPORTANT: route through multi_oracle_prices with the Autonom provider
+                // tag, NOT through oracle_prices (the ChaosLabs legacy slot). The on-chain
+                // program verifies oracle_prices with the ChaosLabs signer key; sending
+                // Autonom data through it would produce InvalidOracleSignature.
+                let multi_oracle_prices = MultiBatchPrices {
+                    batches: vec![BatchPricesWithProvider {
+                        provider: ORACLE_PROVIDER_AUTONOM,
+                        batch: autonom,
+                    }],
+                };
+                Ok((None, Some(multi_oracle_prices), switchboard_oracle_prices))
             }
             (true, true) => {
                 let chaoslabs = self.chaoslabs.take().ok_or_else(|| {

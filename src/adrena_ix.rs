@@ -43,13 +43,6 @@ pub struct SwitchboardUpdateParams {
     pub feed_map: Vec<SwitchboardFeedMapEntry>,
 }
 
-#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct UpdateOracleParams {
-    pub oracle_prices: Option<BatchPrices>,
-    pub multi_oracle_prices: Option<MultiBatchPrices>,
-    pub switchboard_oracle_prices: Option<SwitchboardUpdateParams>,
-}
-
 pub fn build_update_pool_aum_ix(
     payer: &Pubkey,
     pool_pubkey: Pubkey,
@@ -88,57 +81,6 @@ pub fn build_update_pool_aum_ix(
         accounts,
         data: encode_instruction_data("update_pool_aum", &params)?,
     })
-}
-
-pub fn build_update_oracle_ix(
-    multi_oracle_prices: Option<MultiBatchPrices>,
-    switchboard_oracle_prices: Option<SwitchboardUpdateParams>,
-    quote_account: Option<Pubkey>,
-) -> Result<Instruction, anyhow::Error> {
-    let oracle_pda = adrena_abi::pda::get_oracle_pda().0;
-
-    let params = UpdateOracleParams {
-        oracle_prices: None,
-        multi_oracle_prices,
-        switchboard_oracle_prices: switchboard_oracle_prices.clone(),
-    };
-
-    let mut accounts = vec![
-        AccountMeta::new_readonly(adrena_abi::pda::get_cortex_pda().0, false),
-        AccountMeta::new(oracle_pda, false),
-    ];
-
-    // SwitchboardQuote canonical PDA as the first remaining_account
-    if let Some(quote_pubkey) = quote_account {
-        accounts.push(AccountMeta::new_readonly(quote_pubkey, false));
-    }
-
-    Ok(Instruction {
-        program_id: adrena_abi::ID,
-        accounts,
-        data: encode_instruction_data("update_oracle", &params)?,
-    })
-}
-
-pub fn build_update_oracle_switchboard_ix(
-    quote_account: Pubkey,
-    max_age_slots: u64,
-    feed_map: Vec<SwitchboardFeedMapEntry>,
-) -> Result<Instruction, anyhow::Error> {
-    build_update_oracle_ix(
-        None,
-        Some(SwitchboardUpdateParams {
-            max_age_slots,
-            feed_map,
-        }),
-        Some(quote_account),
-    )
-}
-
-pub fn build_update_oracle_multi_ix(
-    multi_oracle_prices: MultiBatchPrices,
-) -> Result<Instruction, anyhow::Error> {
-    build_update_oracle_ix(Some(multi_oracle_prices), None, None)
 }
 
 fn encode_instruction_data<T: BorshSerialize>(

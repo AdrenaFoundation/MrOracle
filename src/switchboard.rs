@@ -239,6 +239,22 @@ pub fn make_switchboard_cycle(
                 )
             })?;
 
+            // Validate instruction_idx contract: adrena-data bakes the Ed25519 instruction
+            // position into quote_store_ix at generation time. MrOracle must place ed25519_ix
+            // at the same tx index, or on-chain verification fails.
+            if let Some(stored_idx) = metadata.get("instruction_idx").and_then(|v| v.as_u64()) {
+                let stored_idx = stored_idx as u32;
+                if stored_idx != config.instruction_idx {
+                    return Err(anyhow::anyhow!(
+                        "switchboard instruction_idx mismatch: adrena-data stored {} but MrOracle expects {} (batch_id={}); \
+                         ensure SWITCHBOARD_INSTRUCTION_IDX matches on both sides",
+                        stored_idx,
+                        config.instruction_idx,
+                        batch_id
+                    ));
+                }
+            }
+
             let output: SidecarOutput = serde_json::from_value(metadata)
                 .context("failed to deserialize switchboard metadata as SidecarOutput")?;
 

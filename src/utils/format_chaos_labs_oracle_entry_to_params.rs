@@ -188,7 +188,12 @@ pub fn format_chaos_labs_oracle_entry_to_params(
         .try_into()
         .map_err(|_| anyhow::anyhow!("chaoslabs signature must be 64 bytes"))?;
 
-    let recovery_id = chaos_labs_oracle_entry.recovery_id as u8;
+    let recovery_id = u8::try_from(chaos_labs_oracle_entry.recovery_id).map_err(|_| {
+        anyhow::anyhow!(
+            "invalid chaoslabs recovery_id {} for legacy assets_price entry",
+            chaos_labs_oracle_entry.recovery_id
+        )
+    })?;
 
     let mut prices = Vec::with_capacity(feed_bindings.len());
     for binding in feed_bindings {
