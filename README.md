@@ -1,220 +1,321 @@
 # MrOracle
 
-OpenSource rust client (Keeper) handling oracle and alp price updates onchain.
+OpenSource Rust keeper handling oracle and ALP price updates on-chain for the Adrena protocol.
+
+MrOracle reads oracle price batches from the adrena-data PostgreSQL database and submits coordinated `update_pool_aum` transactions to the Solana blockchain.
+
+## Table of Contents
+
+- [Architecture](#architecture)
+- [Prerequisites](#prerequisites)
+- [Build](#build)
+- [Configuration](#configuration)
+- [Provider Mode](#provider-mode)
+- [Feed Maps](#feed-maps)
+- [Localnet vs Devnet Deployment](#localnet-vs-devnet-deployment)
+- [CLI Reference](#cli-reference)
+- [Environment Variables](#environment-variables)
+- [Troubleshooting](#troubleshooting)
+
+---
+
+## Architecture
+
+```
+adrena-data DB (oracle_batches)
+        |
+        v
+   +-----------+        +-------------+
+   | ChaosLabs |        | Switchboard |
+   | (DB batch)|        | (crossbar)  |
+   +-----+-----+        +------+------+
+         |                      |
+   +-----+-----+               |
+   |  Autonom   |               |
+   | (DB batch) |               |
+   +-----+------+               |
+         |                      |
+         +----------+-----------+
+                    |
+          [Coordinated Payload]
+                    |
+                    v
+         update_pool_aum TX
+                    |
+                    v
+            Solana Blockchain
+```
+
+- **ChaosLabs & Autonom**: DB-backed signed batch flow. Reads from `oracle_batches` table.
+- **Switchboard**: Native quote flow via Crossbar API. No DB dependency.
+
+---
+
+## Prerequisites
+
+- Rust toolchain (stable)
+- PostgreSQL running with adrena-data tables populated
+- Solana CLI tools
+- `adrena-abi` dependency (local path or git)
+- Funded payer keypair
+
+---
 
 ## Build
 
-`$> cargo build`
-`$> cargo build --release`
+```bash
+cargo build                # debug
+cargo build --release      # production
+```
 
-## Run
+The binary is at `target/release/mroracle`.
 
-`$> cargo run -- --payer-keypair payer.json --endpoint https://adrena.rpcpool.com/xxx --commitment finalized --db-string "postgresql://adrena:YYY.singapore-postgres.render.com/transaction_db_celf" --combined-cert /etc/secrets/combined.pem`
+---
 
-Or on Render
+## Configuration
 
-`./target/release/mroracle --payer-keypair /etc/secrets/mroracle.json --endpoint https://adrena.rpcpool.com/xxx--x-token xxx --commitment finalized --db-string "postgresql://adrena:YYY.singapore-postgres.render.com/transaction_db_celf" --combined-cert /etc/secrets/combined.pem`
+MrOracle accepts configuration via CLI flags, environment variables, or `.env` file. CLI flags take precedence.
 
-Ideally run that on a Render instance.
+### Required
+
+| Flag | Env Var | Description |
+|------|---------|-------------|
+| `--endpoint` | — | Solana RPC URL |
+| `--payer-keypair` | — | Path to funded payer keypair JSON |
+
+### Required for DB-backed providers (ChaosLabs, Autonom)
+
+| Flag | Env Var | Description |
+|------|---------|-------------|
+| `--db-string` | — | PostgreSQL connection string |
+| `--combined-cert` | — | SSL certificate for DB connection |
+
+### Optional
+
+| Flag | Env Var | Default | Description |
+|------|---------|---------|-------------|
+| `--commitment` | — | `finalized` | Solana commitment level |
+| `--main-pool-id` | `MAIN_POOL_ID` | from adrena-abi | Override pool PDA |
+| `--providers` | — | all three | Comma-separated provider list |
+| `--dry-run` | `DRY_RUN` | `false` | Build payloads but skip on-chain sends |
+| `--update-oracle-cu-limit` | — | `1400000` | Compute limit for update tx |
+
+---
 
 ## Provider Mode
 
-Default behavior starts all 3 providers in parallel, buffers each provider's latest update, then
-sends a single coordinated `update_pool_aum` tx only when all selected providers are ready.
+Default behavior starts all 3 providers in parallel, buffers each provider's latest update, then sends a single coordinated `update_pool_aum` tx only when all selected providers are ready.
 
-- ChaosLabs (DB-backed signed batch)
-- Autonom (DB-backed signed batch)
-- Switchboard (native quote flow)
+### Selection
 
-Selection options:
+- `--providers chaoslabs` — single provider
+- `--providers chaoslabs,autonom` — two providers
+- `--providers chaoslabs,autonom,switchboard` — all three (default)
+- `--only-chaoslabs` / `--only-autonom` / `--only-switchboard` — shorthand
 
-- `--only-chaoslabs`
-- `--only-autonom`
-- `--only-switchboard`
-- `--providers <list>` where `<list>` is comma-separated:
-  - `chaoslabs`
-  - `autonom`
-  - `switchboard`
-  - example: `--providers chaoslabs,autonom`
+### Payload Shape
 
-The `--providers` flag supports single, any two-provider combination, or all three providers.
+| Providers | Payload Type |
+|-----------|-------------|
+| ChaosLabs only OR Autonom only | `BatchPrices` |
+| ChaosLabs + Switchboard OR Autonom + Switchboard | `BatchPrices + SwitchboardPrices` |
+| ChaosLabs + Autonom | `MultiBatchPrices` |
+| All three | `MultiBatchPrices + SwitchboardPrices` |
 
-### Payload shape by provider set
+### Startup Behavior
 
-- ChaosLabs only OR Autonom only: `BatchPrices`
-- ChaosLabs + Switchboard OR Autonom + Switchboard: `BatchPrices + SwitchboardPrices`
-- ChaosLabs + Autonom: `MultiBatchPrices`
-- ChaosLabs + Autonom + Switchboard: `MultiBatchPrices + SwitchboardPrices`
+- **Explicit selection** (`--providers` or `--only-*`): any selected provider failure is a hard fail (process exits)
+- **Default mode** (no selection): soft-fail per provider — misconfigured providers are disabled, healthy ones continue
+- If all providers fail startup, keeper stays alive in passive mode and logs errors
 
-### CLI examples
+---
 
-Use your own values for:
-- `RPC_URL`
-- `PAYER_KEYPAIR`
-- `MAIN_POOL_ID` (optional; defaults to main pool id baked in `adrena-abi`)
-- `DB_STRING`
-- `COMBINED_CERT`
-- `CHAOSLABS_FEED_MAP_PATH`
-- `AUTONOM_FEED_MAP_PATH`
-- `SWITCHBOARD_API_KEY`
-- `SWITCHBOARD_FEED_MAP_PATH`
+## Feed Maps
 
-#### 1 provider
+Each provider uses a JSON feed map in `config/`. These must match the feed maps in `adrena-data/cron/config/` for prices to flow correctly.
 
-ChaosLabs:
+| File | Provider | Env/Flag |
+|------|----------|----------|
+| `config/chaoslabs_feed_map.json` | ChaosLabs | `--chaoslabs-feed-map-path` / `CHAOSLABS_FEED_MAP_PATH` |
+| `config/autonom_feed_map.json` | Autonom | `--autonom-feed-map-path` / `AUTONOM_FEED_MAP_PATH` |
+| `config/switchboard_feed_map.json` | Switchboard | `--switchboard-feed-map-path` / `SWITCHBOARD_FEED_MAP_PATH` |
+
+Example files are in `feed_map_examples/`.
+
+ChaosLabs signature verification is order-sensitive. Keep feed map entries in the same signed order expected by the upstream signer.
+
+---
+
+## Localnet vs Devnet Deployment
+
+### Comparison
+
+| Setting | Localnet | Devnet |
+|---------|----------|--------|
+| RPC | `http://127.0.0.1:8899` | Devnet RPC (Helius, Triton, etc.) |
+| DB | `adrena_tx_local` on localhost | `adrena_tx_devnet` on localhost |
+| SSL cert | Self-signed (`generated/combined.pem`) | Self-signed (`generated/combined.pem`) |
+| Switchboard queue | `A43DyUGA7s8eXPxqEjJY6EBu1KKbNgfxF8h17VAHn13w` | `EYiAmGSdsQTuCw413V5BzaruWuCCSDgTPtBGvLkXHbe7` |
+| Pool ID | From localnet deployment manifest | From devnet deployment manifest |
+| Payer keypair | `adrena-keypairs/localnet/payer.json` | `adrena-keypairs/devnet/payer.json` |
+| tmux session | `adrena-local` | `adrena-devnet` |
+
+### Manual Localnet Setup
+
+1. Deploy the Adrena program (`setup-adrena.sh --mode localnet`)
+2. Patch adrena-abi with correct PDAs (`setup-adrena-abi.sh --mode localnet`)
+3. Set up adrena-data DB + crons (`setup-adrena-data.sh --mode localnet`)
+4. Build MrOracle: `cargo build --release`
+5. Run:
 
 ```bash
-cargo run --bin mroracle -- \
-  --endpoint "$RPC_URL" \
-  --payer-keypair "$PAYER_KEYPAIR" \
-  --providers chaoslabs \
+POOL_ID="<from manifest>"
+PAYER_KP="adrena-keypairs/localnet/payer.json"
+DB_STRING="host=localhost port=5432 user=adrena_local password=adrena_local_pw dbname=adrena_tx_local sslmode=prefer"
+SSL_CERT="../local-execution/generated/combined.pem"
+
+RUST_LOG=info ./target/release/mroracle \
+  --endpoint http://127.0.0.1:8899 \
+  --payer-keypair "$PAYER_KP" \
   --db-string "$DB_STRING" \
-  --combined-cert "$COMBINED_CERT" \
-  --chaoslabs-feed-map-path "$CHAOSLABS_FEED_MAP_PATH"
-```
-
-Autonom:
-
-```bash
-cargo run --bin mroracle -- \
-  --endpoint "$RPC_URL" \
-  --payer-keypair "$PAYER_KEYPAIR" \
-  --providers autonom \
-  --db-string "$DB_STRING" \
-  --combined-cert "$COMBINED_CERT" \
-  --autonom-feed-map-path "$AUTONOM_FEED_MAP_PATH"
-```
-
-Switchboard:
-
-```bash
-cargo run --bin mroracle -- \
-  --endpoint "$RPC_URL" \
-  --payer-keypair "$PAYER_KEYPAIR" \
-  --providers switchboard \
-  --switchboard-api-key "$SWITCHBOARD_API_KEY" \
-  --switchboard-feed-map-path "$SWITCHBOARD_FEED_MAP_PATH"
-```
-
-#### 2 providers
-
-ChaosLabs + Autonom:
-
-```bash
-cargo run --bin mroracle -- \
-  --endpoint "$RPC_URL" \
-  --payer-keypair "$PAYER_KEYPAIR" \
-  --providers chaoslabs,autonom \
-  --db-string "$DB_STRING" \
-  --combined-cert "$COMBINED_CERT" \
-  --chaoslabs-feed-map-path "$CHAOSLABS_FEED_MAP_PATH" \
-  --autonom-feed-map-path "$AUTONOM_FEED_MAP_PATH"
-```
-
-ChaosLabs + Switchboard:
-
-```bash
-cargo run --bin mroracle -- \
-  --endpoint "$RPC_URL" \
-  --payer-keypair "$PAYER_KEYPAIR" \
-  --providers chaoslabs,switchboard \
-  --db-string "$DB_STRING" \
-  --combined-cert "$COMBINED_CERT" \
-  --chaoslabs-feed-map-path "$CHAOSLABS_FEED_MAP_PATH" \
-  --switchboard-api-key "$SWITCHBOARD_API_KEY" \
-  --switchboard-feed-map-path "$SWITCHBOARD_FEED_MAP_PATH"
-```
-
-Autonom + Switchboard:
-
-```bash
-cargo run --bin mroracle -- \
-  --endpoint "$RPC_URL" \
-  --payer-keypair "$PAYER_KEYPAIR" \
-  --providers autonom,switchboard \
-  --db-string "$DB_STRING" \
-  --combined-cert "$COMBINED_CERT" \
-  --autonom-feed-map-path "$AUTONOM_FEED_MAP_PATH" \
-  --switchboard-api-key "$SWITCHBOARD_API_KEY" \
-  --switchboard-feed-map-path "$SWITCHBOARD_FEED_MAP_PATH"
-```
-
-#### 3 providers
-
-```bash
-cargo run --bin mroracle -- \
-  --endpoint "$RPC_URL" \
-  --payer-keypair "$PAYER_KEYPAIR" \
+  --combined-cert "$SSL_CERT" \
+  --switchboard-queue-pubkey A43DyUGA7s8eXPxqEjJY6EBu1KKbNgfxF8h17VAHn13w \
   --providers chaoslabs,autonom,switchboard \
-  --db-string "$DB_STRING" \
-  --combined-cert "$COMBINED_CERT" \
-  --chaoslabs-feed-map-path "$CHAOSLABS_FEED_MAP_PATH" \
-  --autonom-feed-map-path "$AUTONOM_FEED_MAP_PATH" \
-  --switchboard-api-key "$SWITCHBOARD_API_KEY" \
-  --switchboard-feed-map-path "$SWITCHBOARD_FEED_MAP_PATH"
+  --commitment confirmed
 ```
 
-## Switchboard Runtime (Native Quote Flow)
+### Manual Devnet Setup
 
-Switchboard uses:
+Same flow but with devnet values:
 
-- `--switchboard-feed-map-path <path>` or `SWITCHBOARD_FEED_MAP_PATH`
-- `--switchboard-api-key <key>` or `SWITCHBOARD_API_KEY`
+```bash
+RUST_LOG=info ./target/release/mroracle \
+  --endpoint "$DEVNET_RPC_URL" \
+  --payer-keypair adrena-keypairs/devnet/payer.json \
+  --db-string "host=localhost port=5432 user=adrena_devnet password=adrena_devnet_pw dbname=adrena_tx_devnet sslmode=prefer" \
+  --combined-cert "../local-execution/generated/combined.pem" \
+  --switchboard-queue-pubkey EYiAmGSdsQTuCw413V5BzaruWuCCSDgTPtBGvLkXHbe7 \
+  --providers chaoslabs,autonom,switchboard \
+  --commitment confirmed
+```
 
-Optional overrides:
+### Automated (via local-execution)
 
-- `--switchboard-crossbar-url` (default `https://crossbar.switchboard.xyz`)
-- `--switchboard-gateway-url` (dedicated endpoint)
-- `--switchboard-network` (default `mainnet`)
-- `--switchboard-queue-pubkey` (default mainnet queue)
-- `--switchboard-cycle-ms` (default `5000`)
-- `--switchboard-max-age-slots` (default `32`)
-- `--update-oracle-cu-limit` (default `1400000`, compute limit for coordinated `update_pool_aum`)
+```bash
+cd local-execution
+npm run start -- --mode localnet   # full deploy + start
+npm run start -- --mode devnet     # devnet deploy + start
+```
 
-Feed map format example is in `feed_map_examples/switchboard_feed_map.example.json`.
+The orchestrator runs `scripts/setup-mroracle.sh` which:
+1. Reads pool ID and payer keypair from the deployment manifest
+2. Generates `.env` with feed map paths
+3. Builds MrOracle (`cargo build --release`)
+4. Starts in tmux with correct DB string, SSL cert, and Switchboard queue
 
-## Autonom Runtime (Signed Batch Flow)
+### DRY_RUN Mode
 
-Autonom in keeper is DB-backed and consumes batches already ingested in `adrena-data` (`oracle_batches` + `oracle_batch_prices`).
+Set `DRY_RUN=true` to build oracle payloads without submitting transactions. Useful for testing the full pipeline without affecting on-chain state.
 
-Autonom uses:
+---
 
-- `--autonom-feed-map-path <path>` or `AUTONOM_FEED_MAP_PATH`
+## CLI Reference
 
-Optional overrides:
+### Single Provider
 
-- `--autonom-poll-ms` (default `3000`)
-- `--update-oracle-cu-limit` (compute limit for coordinated `update_pool_aum`)
+```bash
+# ChaosLabs only
+cargo run --bin mroracle -- --endpoint "$RPC" --payer-keypair kp.json \
+  --providers chaoslabs --db-string "$DB" --combined-cert cert.pem \
+  --chaoslabs-feed-map-path config/chaoslabs_feed_map.json
 
-Autonom feed map format:
-- `autonom_feed_map[].adrena_feed_id = <adrena provider feed id>`
-- `autonom_feed_map[].autonom_feed_id = <autonom canonical feed id>`
+# Autonom only
+cargo run --bin mroracle -- --endpoint "$RPC" --payer-keypair kp.json \
+  --providers autonom --db-string "$DB" --combined-cert cert.pem \
+  --autonom-feed-map-path config/autonom_feed_map.json
 
-Primary example file: `feed_map_examples/autonom_feed_map.example.json`.
+# Switchboard only
+cargo run --bin mroracle -- --endpoint "$RPC" --payer-keypair kp.json \
+  --providers switchboard \
+  --switchboard-api-key "$KEY" --switchboard-feed-map-path config/switchboard_feed_map.json
+```
 
-## ChaosLabs Mapping
+### All Three Providers
 
-ChaosLabs uses:
+```bash
+cargo run --bin mroracle -- --endpoint "$RPC" --payer-keypair kp.json \
+  --providers chaoslabs,autonom,switchboard \
+  --db-string "$DB" --combined-cert cert.pem \
+  --chaoslabs-feed-map-path config/chaoslabs_feed_map.json \
+  --autonom-feed-map-path config/autonom_feed_map.json \
+  --switchboard-api-key "$KEY" --switchboard-feed-map-path config/switchboard_feed_map.json
+```
 
-- `--chaoslabs-feed-map-path <path>` or `CHAOSLABS_FEED_MAP_PATH`
+---
 
-For reference and keeper-side consistency, an example mapping file is provided at:
-- `feed_map_examples/chaoslabs_feed_map.example.json`
+## Environment Variables
 
-Important: ChaosLabs signature verification is order-sensitive. Keep `chaoslabs_feed_map` entries
-in the same signed order expected by your upstream signer.
+Can be set in `.env` file at project root or via shell environment.
 
-ChaosLabs keeper consumption is DB-backed and prefers `oracle_batches` (`provider='chaoslabs'`).
-It falls back to legacy `assets_price` if the new tables are unavailable.
+| Variable | Description |
+|----------|-------------|
+| `RUST_LOG` | Log level (`debug`, `info`, `warn`, `error`) |
+| `DRY_RUN` | `true` to skip on-chain sends |
+| `MAIN_POOL_ID` | Override pool PDA (otherwise from adrena-abi) |
+| `CHAOSLABS_FEED_MAP_PATH` | Path to ChaosLabs feed map JSON |
+| `AUTONOM_FEED_MAP_PATH` | Path to Autonom feed map JSON |
+| `SWITCHBOARD_FEED_MAP_PATH` | Path to Switchboard feed map JSON |
+| `SWITCHBOARD_API_KEY` | Switchboard API key |
 
-## Provider Startup Behavior
+---
 
-- In default mode, all 3 providers are attempted.
-- If providers are explicitly selected via CLI (`--providers` or `--only-*`), startup is strict:
-  - Any selected provider init/config failure is a hard fail (process exits).
-- Without explicit provider selection, startup is soft-fail by provider:
-  - If one provider is misconfigured/unavailable, that provider is disabled.
-  - Remaining healthy providers continue running.
-- In non-explicit mode, keeper process does not exit just because one provider setup fails.
-- `--db-string` and `--combined-cert` are only required for DB-backed providers (ChaosLabs/Autonom) to be active.
-- In non-explicit mode, if all attempted providers fail startup checks, keeper stays alive in passive mode and logs errors.
+## Troubleshooting
+
+### `adrena-abi` build errors after branch switch
+
+If you switch branches on adrena-abi, MrOracle won't build because the cached dependency is stale:
+
+```bash
+cd MrOracle && cargo clean && cargo build --release
+```
+
+### "Pool not found" or wrong pool ID
+
+The pool ID is baked into `adrena-abi/src/lib.rs`. If you redeployed the program, re-run `setup-adrena-abi.sh` to patch the correct PDAs, then rebuild MrOracle.
+
+### DB connection refused
+
+Ensure PostgreSQL is running and the DB/user exist:
+
+```bash
+sudo systemctl start postgresql
+pg_isready
+PGPASSWORD=adrena_local_pw psql -h localhost -U adrena_local -d adrena_tx_local -c "SELECT 1"
+```
+
+### No oracle batches in DB
+
+MrOracle reads from `oracle_batches` table populated by adrena-data cron. Ensure the cron processes are running:
+
+```bash
+tmux attach -t adrena-local  # check cron windows
+```
+
+### Cargo.toml uses git dependency instead of local path
+
+For local development, the setup script patches `adrena-abi = { git = "..." }` to `adrena-abi = { path = "../adrena-abi" }`. If you see git dependency errors, either:
+- Run `setup-mroracle.sh --mode localnet` (patches automatically), or
+- Manually edit `Cargo.toml`:
+  ```toml
+  adrena-abi = { path = "../adrena-abi" }
+  ```
+
+### Feed map mismatch
+
+MrOracle's feed maps must match adrena-data's. The `local-execution validate` command checks this automatically:
+
+```bash
+cd local-execution && npm run validate -- --mode localnet
+```
+
+Look for "Feed map" results in the static analysis output.
