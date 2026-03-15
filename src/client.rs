@@ -23,18 +23,15 @@ pub mod autonom;
 pub mod db;
 pub mod handlers;
 pub mod oracle_poller;
+pub mod pool_config;
 pub mod priority_fees;
 pub mod provider_updates;
 pub mod switchboard;
 pub mod utils;
 
 use {
-    adrena_abi::oracle::BatchPrices,
-    adrena_ix::{
-        BatchPricesWithProvider, MultiBatchPrices, ORACLE_PROVIDER_AUTONOM,
-        ORACLE_PROVIDER_CHAOS_LABS,
-    },
-    provider_updates::{ProviderUpdate, SwitchboardOraclePricesUpdate},
+    pool_config::PoolRuntime,
+    provider_updates::ProviderUpdate,
     utils::format_chaos_labs_oracle_entry_to_params::{
         format_chaos_labs_oracle_batch_to_params, format_chaos_labs_oracle_entry_to_params,
         load_chaos_labs_feed_map, ChaosLabsFeedBinding,
@@ -169,110 +166,21 @@ struct Args {
         long,
         value_delimiter = ',',
         num_args = 1..=3,
-        conflicts_with_all = ["only_chaoslabs", "only_autonom", "only_switchboard"]
+        conflicts_with_all = ["only_chaoslabs", "only_autonom", "only_switchboard", "pools_config"]
     )]
     providers: Option<Vec<ProviderArg>>,
+
+    /// Path to multi-pool config JSON. When set, each pool declares its own providers.
+    /// Replaces MAIN_POOL_ID and --providers / --only-* flags.
+    #[clap(
+        long,
+        conflicts_with_all = ["only_chaoslabs", "only_autonom", "only_switchboard", "providers"]
+    )]
+    pools_config: Option<String>,
 }
 
-#[derive(Default)]
-struct PendingProviderUpdates {
-    chaoslabs: Option<BatchPrices>,
-    autonom: Option<BatchPrices>,
-    switchboard: Option<SwitchboardOraclePricesUpdate>,
-}
-
-impl PendingProviderUpdates {
-    fn ingest(&mut self, update: ProviderUpdate) {
-        match update {
-            ProviderUpdate::ChaosLabs(batch) => self.chaoslabs = Some(batch),
-            ProviderUpdate::Autonom(batch) => self.autonom = Some(batch),
-            ProviderUpdate::Switchboard(update) => self.switchboard = Some(update),
-        }
-    }
-
-    fn is_ready(&self, run_chaoslabs: bool, run_autonom: bool, run_switchboard: bool) -> bool {
-        (!run_chaoslabs || self.chaoslabs.is_some())
-            && (!run_autonom || self.autonom.is_some())
-            && (!run_switchboard || self.switchboard.is_some())
-    }
-
-    fn take_payload(
-        &mut self,
-        run_chaoslabs: bool,
-        run_autonom: bool,
-        run_switchboard: bool,
-    ) -> Result<
-        (
-            Option<BatchPrices>,
-            Option<MultiBatchPrices>,
-            Option<SwitchboardOraclePricesUpdate>,
-        ),
-        anyhow::Error,
-    > {
-        let switchboard_oracle_prices = if run_switchboard {
-            Some(self.switchboard.take().ok_or_else(|| {
-                anyhow::anyhow!("missing switchboard payload for coordinated cycle")
-            })?)
-        } else {
-            None
-        };
-
-        match (run_chaoslabs, run_autonom) {
-            (true, false) => {
-                let chaoslabs = self.chaoslabs.take().ok_or_else(|| {
-                    anyhow::anyhow!("missing chaoslabs payload for coordinated cycle")
-                })?;
-                let multi_oracle_prices = MultiBatchPrices {
-                    batches: vec![BatchPricesWithProvider {
-                        provider: ORACLE_PROVIDER_CHAOS_LABS,
-                        batch: chaoslabs,
-                    }],
-                };
-                Ok((None, Some(multi_oracle_prices), switchboard_oracle_prices))
-            }
-            (false, true) => {
-                let autonom = self.autonom.take().ok_or_else(|| {
-                    anyhow::anyhow!("missing autonom payload for coordinated cycle")
-                })?;
-                // IMPORTANT: route through multi_oracle_prices with the Autonom provider
-                // tag, NOT through oracle_prices (the ChaosLabs legacy slot). The on-chain
-                // program verifies oracle_prices with the ChaosLabs signer key; sending
-                // Autonom data through it would produce InvalidOracleSignature.
-                let multi_oracle_prices = MultiBatchPrices {
-                    batches: vec![BatchPricesWithProvider {
-                        provider: ORACLE_PROVIDER_AUTONOM,
-                        batch: autonom,
-                    }],
-                };
-                Ok((None, Some(multi_oracle_prices), switchboard_oracle_prices))
-            }
-            (true, true) => {
-                let chaoslabs = self.chaoslabs.take().ok_or_else(|| {
-                    anyhow::anyhow!("missing chaoslabs payload for coordinated cycle")
-                })?;
-                let autonom = self.autonom.take().ok_or_else(|| {
-                    anyhow::anyhow!("missing autonom payload for coordinated cycle")
-                })?;
-
-                let multi_oracle_prices = MultiBatchPrices {
-                    batches: vec![
-                        BatchPricesWithProvider {
-                            provider: ORACLE_PROVIDER_CHAOS_LABS,
-                            batch: chaoslabs,
-                        },
-                        BatchPricesWithProvider {
-                            provider: ORACLE_PROVIDER_AUTONOM,
-                            batch: autonom,
-                        },
-                    ],
-                };
-
-                Ok((None, Some(multi_oracle_prices), switchboard_oracle_prices))
-            }
-            (false, false) => Ok((None, None, switchboard_oracle_prices)),
-        }
-    }
-}
+// PendingProviderUpdates logic moved to pool_config::PerPoolPending to support
+// per-pool provider tracking. See pool_config.rs.
 
 fn resolve_provider_mode(args: &Args) -> (bool, bool, bool) {
     if let Some(providers) = args.providers.as_ref() {
@@ -470,21 +378,56 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let args = Args::parse();
     let strict_provider_init = has_explicit_provider_selection(&args);
-    let pool_pubkey = resolve_target_pool_pubkey()?;
+    let multi_pool_mode = args.pools_config.is_some();
 
-    let (requested_chaoslabs, requested_autonom, requested_switchboard) =
-        resolve_provider_mode(&args);
-    let mut active_chaoslabs = requested_chaoslabs;
-    let mut active_autonom = requested_autonom;
-    let mut active_switchboard = requested_switchboard;
+    // Resolve pool runtimes: either from config file or single-pool legacy mode.
+    let mut pool_runtimes: Vec<PoolRuntime> = if let Some(ref config_path) = args.pools_config {
+        let config = pool_config::load_pools_config(config_path)?;
+        let runtimes = pool_config::resolve_pool_runtimes(&config)?;
+        for rt in &runtimes {
+            log::info!(
+                "Pool `{}` => {} (chaoslabs={}, autonom={}, switchboard={}, cu={})",
+                rt.name,
+                rt.address,
+                rt.needs_chaoslabs,
+                rt.needs_autonom,
+                rt.needs_switchboard,
+                rt.cu_limit,
+            );
+        }
+        runtimes
+    } else {
+        let pool_pubkey = resolve_target_pool_pubkey()?;
+        let (rc, ra, rs) = resolve_provider_mode(&args);
+        log::info!("Target pool => {}", pool_pubkey);
+        vec![PoolRuntime {
+            name: "main".to_string(),
+            address: pool_pubkey,
+            needs_chaoslabs: rc,
+            needs_autonom: ra,
+            needs_switchboard: rs,
+            cu_limit: if rs {
+                args.update_oracle_cu_limit
+            } else {
+                UPDATE_AUM_CU_LIMIT
+            },
+            custody_accounts: vec![],
+            pending: pool_config::PerPoolPending::default(),
+        }]
+    };
 
-    log::info!("Target pool => {}", pool_pubkey);
+    // Active provider flags = union of all pools' requirements.
+    let (mut active_chaoslabs, mut active_autonom, mut active_switchboard) = if multi_pool_mode {
+        pool_config::aggregate_provider_requirements(&pool_runtimes)
+    } else {
+        resolve_provider_mode(&args)
+    };
 
     log::info!(
         "Requested provider mode => chaoslabs={}, autonom={}, switchboard={}",
-        requested_chaoslabs,
-        requested_autonom,
-        requested_switchboard
+        active_chaoslabs,
+        active_autonom,
+        active_switchboard
     );
 
     let payer = read_keypair_file(args.payer_keypair.clone()).map_err(|e| {
@@ -597,25 +540,33 @@ async fn main() -> Result<(), anyhow::Error> {
         });
     }
 
-    let custody_accounts = if dry_run {
+    if dry_run {
         log::info!("DRY_RUN: skipping custody account loading (no RPC needed)");
-        vec![]
     } else if active_chaoslabs || active_autonom || active_switchboard {
-        loop {
-            match load_custody_accounts(&program, pool_pubkey).await {
-                Ok(accounts) => break accounts,
-                Err(err) => {
-                    log::error!(
-                        "Failed to load custody accounts (will retry in 5s): {:?}",
-                        err
-                    );
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+        for rt in &mut pool_runtimes {
+            loop {
+                match load_custody_accounts(&program, rt.address).await {
+                    Ok(accounts) => {
+                        log::info!(
+                            "[{}] Loaded {} custody accounts",
+                            rt.name,
+                            accounts.len()
+                        );
+                        rt.custody_accounts = accounts;
+                        break;
+                    }
+                    Err(err) => {
+                        log::error!(
+                            "[{}] Failed to load custody accounts (retrying in 5s): {:?}",
+                            rt.name,
+                            err
+                        );
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
                 }
             }
         }
-    } else {
-        vec![]
-    };
+    }
 
     let (provider_updates_tx, mut provider_updates_rx) = mpsc::channel::<ProviderUpdate>(128);
 
@@ -836,56 +787,76 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     }
 
-    let mut pending_updates = PendingProviderUpdates::default();
-
     while let Some(update) = provider_updates_rx.recv().await {
-        pending_updates.ingest(update);
-
-        if !pending_updates.is_ready(active_chaoslabs, active_autonom, active_switchboard) {
-            continue;
-        }
-
-        let (oracle_prices, multi_oracle_prices, switchboard_oracle_prices) = match pending_updates
-            .take_payload(active_chaoslabs, active_autonom, active_switchboard)
-        {
-            Ok(payload) => payload,
-            Err(err) => {
-                log::error!("Failed to compose coordinated provider payload: {:?}", err);
-                continue;
-            }
-        };
-
-        if dry_run {
-            let has_chaoslabs = oracle_prices.is_some();
-            let has_multi = multi_oracle_prices.as_ref().map(|m| m.batches.len()).unwrap_or(0);
-            let has_switchboard = switchboard_oracle_prices.is_some();
-            log::info!(
-                "   <> DRY_RUN payload ready: chaoslabs={}, multi_batches={}, switchboard={}",
-                has_chaoslabs,
-                has_multi,
-                has_switchboard
-            );
-        } else {
-            let priority_fee = *median_priority_fee.lock().await;
-            let cu_limit = if active_switchboard {
-                args.update_oracle_cu_limit
-            } else {
-                UPDATE_AUM_CU_LIMIT
+        // Distribute this provider update to every pool that needs it.
+        for rt in &mut pool_runtimes {
+            let needs = match &update {
+                ProviderUpdate::ChaosLabs(_) => rt.needs_chaoslabs,
+                ProviderUpdate::Autonom(_) => rt.needs_autonom,
+                ProviderUpdate::Switchboard(_) => rt.needs_switchboard,
             };
 
-            if let Err(err) = handlers::update_pool_aum_combined(
-                &program,
-                pool_pubkey,
-                priority_fee,
-                cu_limit,
-                oracle_prices,
-                multi_oracle_prices,
-                switchboard_oracle_prices,
-                custody_accounts.clone(),
-            )
-            .await
+            if needs {
+                rt.pending.ingest(&update);
+            }
+
+            if !rt
+                .pending
+                .is_ready(rt.needs_chaoslabs, rt.needs_autonom, rt.needs_switchboard)
             {
-                log::error!("Coordinated update_pool_aum send failed (soft fail): {err:?}");
+                continue;
+            }
+
+            // This pool has all required providers — fire update_pool_aum.
+            let (oracle_prices, multi_oracle_prices, switchboard_oracle_prices) = match rt
+                .pending
+                .take_payload(rt.needs_chaoslabs, rt.needs_autonom, rt.needs_switchboard)
+            {
+                Ok(payload) => payload,
+                Err(err) => {
+                    log::error!(
+                        "[{}] Failed to compose provider payload: {:?}",
+                        rt.name,
+                        err
+                    );
+                    continue;
+                }
+            };
+
+            if dry_run {
+                let has_chaoslabs = oracle_prices.is_some();
+                let has_multi = multi_oracle_prices
+                    .as_ref()
+                    .map(|m| m.batches.len())
+                    .unwrap_or(0);
+                let has_switchboard = switchboard_oracle_prices.is_some();
+                log::info!(
+                    "   <> [{}] DRY_RUN payload ready: chaoslabs={}, multi_batches={}, switchboard={}",
+                    rt.name,
+                    has_chaoslabs,
+                    has_multi,
+                    has_switchboard
+                );
+            } else {
+                let priority_fee = *median_priority_fee.lock().await;
+
+                if let Err(err) = handlers::update_pool_aum_combined(
+                    &program,
+                    rt.address,
+                    priority_fee,
+                    rt.cu_limit,
+                    oracle_prices,
+                    multi_oracle_prices,
+                    switchboard_oracle_prices,
+                    rt.custody_accounts.clone(),
+                )
+                .await
+                {
+                    log::error!(
+                        "[{}] update_pool_aum send failed (soft fail): {err:?}",
+                        rt.name
+                    );
+                }
             }
         }
     }

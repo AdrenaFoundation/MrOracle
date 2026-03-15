@@ -11,6 +11,7 @@ MrOracle reads oracle price batches from the adrena-data PostgreSQL database and
 - [Build](#build)
 - [Configuration](#configuration)
 - [Provider Mode](#provider-mode)
+- [Multi-Pool Mode](#multi-pool-mode)
 - [Feed Maps](#feed-maps)
 - [Localnet vs Devnet Deployment](#localnet-vs-devnet-deployment)
 - [CLI Reference](#cli-reference)
@@ -95,8 +96,9 @@ MrOracle accepts configuration via CLI flags, environment variables, or `.env` f
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
 | `--commitment` | — | `finalized` | Solana commitment level |
-| `--main-pool-id` | `MAIN_POOL_ID` | from adrena-abi | Override pool PDA |
-| `--providers` | — | all three | Comma-separated provider list |
+| `--main-pool-id` | `MAIN_POOL_ID` | from adrena-abi | Override pool PDA (single-pool mode) |
+| `--providers` | — | all three | Comma-separated provider list (single-pool mode) |
+| `--pools-config` | — | — | Path to multi-pool config JSON (see [Multi-Pool Mode](#multi-pool-mode)) |
 | `--dry-run` | `DRY_RUN` | `false` | Build payloads but skip on-chain sends |
 | `--update-oracle-cu-limit` | — | `1400000` | Compute limit for update tx |
 
@@ -127,6 +129,70 @@ Default behavior starts all 3 providers in parallel, buffers each provider's lat
 - **Explicit selection** (`--providers` or `--only-*`): any selected provider failure is a hard fail (process exits)
 - **Default mode** (no selection): soft-fail per provider — misconfigured providers are disabled, healthy ones continue
 - If all providers fail startup, keeper stays alive in passive mode and logs errors
+
+---
+
+## Multi-Pool Mode
+
+When multiple pools exist with different oracle provider requirements, use `--pools-config` to define per-pool provider mappings. MrOracle will update each pool's AUM independently with only the providers it needs.
+
+### Config File
+
+Create a `pools_config.json` (see `pools_config.example.json`):
+
+```json
+{
+  "pools": [
+    {
+      "name": "main-pool",
+      "address": "PoolPubkeyBase58...",
+      "providers": ["chaoslabs", "autonom", "switchboard"],
+      "cu_limit": 1400000
+    },
+    {
+      "name": "autonom-pool",
+      "address": "AnotherPoolPubkey...",
+      "providers": ["autonom"],
+      "cu_limit": 120000
+    },
+    {
+      "name": "sb-pool",
+      "address": "ThirdPoolPubkey...",
+      "providers": ["switchboard"],
+      "cu_limit": 1400000
+    }
+  ]
+}
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | yes | Human-readable label (used in logs) |
+| `address` | yes | Pool account pubkey (base58) |
+| `providers` | yes | Array of `"chaoslabs"`, `"autonom"`, `"switchboard"` |
+| `cu_limit` | no | Compute unit limit (defaults to 1,400,000 if switchboard is included, 120,000 otherwise) |
+
+### Usage
+
+```bash
+cargo run --bin mroracle -- --endpoint "$RPC" --payer-keypair kp.json \
+  --pools-config pools_config.json \
+  --db-string "$DB" --combined-cert cert.pem \
+  --chaoslabs-feed-map-path config/chaoslabs_feed_map.json \
+  --autonom-feed-map-path config/autonom_feed_map.json \
+  --switchboard-feed-map-path config/switchboard_feed_map.json
+```
+
+### How It Works
+
+1. MrOracle starts the global provider pollers based on the **union** of all pools' provider requirements. If any pool needs ChaosLabs, the ChaosLabs poller starts. Same for Autonom and Switchboard.
+2. When a provider update arrives, it's distributed to every pool that declared that provider.
+3. Each pool independently tracks readiness. A pool fires its `update_pool_aum` transaction only when **all** of its declared providers have delivered fresh data.
+4. Each pool's transaction is self-contained with its own custody accounts, CU limit, and provider payloads.
+
+### Backward Compatibility
+
+`--pools-config` conflicts with `--providers`, `--only-chaoslabs`, `--only-autonom`, and `--only-switchboard`. Without `--pools-config`, MrOracle behaves exactly as before: single pool via `MAIN_POOL_ID` env var, provider selection via CLI flags.
 
 ---
 

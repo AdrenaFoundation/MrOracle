@@ -1,0 +1,22 @@
+{
+  "pools": [
+    {
+      "name": "main-pool",
+      "address": "POOL_PUBKEY_BASE58_HERE",
+      "providers": ["chaoslabs", "autonom", "switchboard"],
+      "cu_limit": 1400000
+    },
+    {
+      "name": "autonom-pool",
+      "address": "AUTONOM_POOL_PUBKEY_HERE",
+      "providers": ["autonom"],
+      "cu_limit": 120000
+    },
+    {
+      "name": "sb-pool",
+      "address": "SWITCHBOARD_POOL_PUBKEY_HERE",
+      "providers": ["switchboard"],
+      "cu_limit": 1400000
+    }
+  ]
+}
