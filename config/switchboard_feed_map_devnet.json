@@ -1,0 +1,26 @@
+{
+  "_schema_version": "2",
+  "_note": "Devnet Switchboard feeds — queue EYiAmGSdsQTuCw413V5BzaruWuCCSDgTPtBGvLkXHbe7",
+  "switchboard_feed_map": [
+    {
+      "adrena_feed_id": 142,
+      "switchboard_feed_hash": "55635a575855dbe17cfd2eac7bd74545d25fa922955d16d37fe031605cfef3fd",
+      "_comment": "WBTC/USD — 4XkjiTAJXfvmB34WEUw3mYLtePGoShjurye8BibSbiD8"
+    },
+    {
+      "adrena_feed_id": 143,
+      "switchboard_feed_hash": "db872d08486a03e2152d985a3fdaa2ff8f6d047bacaf12323dcde02340ea245b",
+      "_comment": "SOL/USD (used as jitoSOL placeholder) — 9KBGYa1hnH9EnrThDhzsPPyWqP5qGEpNHU9yGBhdggai"
+    },
+    {
+      "adrena_feed_id": 144,
+      "switchboard_feed_hash": "172f81ad7f6ea56fff6008d2f3c2d5c7a3860bf92797a4bee523707abc702a23",
+      "_comment": "BONK/USD — HhNHzSJjQuhni5GwaVkhqBQrMz1EZAW5Nt32RKnZAL2g"
+    },
+    {
+      "adrena_feed_id": 145,
+      "switchboard_feed_hash": "a2fdd199da0770fb648ed034cb2317a5d9452853a103f894c6d0f965ee97aa43",
+      "_comment": "USDC/USD — CWajqu4CEqyL9HjMXDvo5Rk7EW4uymP9zeKKfexTxVey"
+    }
+  ]
+}
