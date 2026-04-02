@@ -13,8 +13,10 @@ use {
 pub mod db;
 pub mod handlers;
 pub mod priority_fees;
+pub mod rpc_fallback;
 pub mod utils;
 
+use rpc_fallback::RpcFallback;
 use utils::format_chaos_labs_oracle_entry_to_params::format_chaos_labs_oracle_entry_to_params;
 
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:10000";
@@ -55,6 +57,14 @@ struct Args {
     /// Combined certificate
     #[clap(long)]
     combined_cert: String,
+
+    /// Backup RPC endpoint URL (optional, used as fallback)
+    #[clap(long)]
+    rpc_backup: Option<String>,
+
+    /// Public RPC endpoint URL (last-resort fallback)
+    #[clap(long, default_value_t = String::from(rpc_fallback::DEFAULT_PUBLIC_RPC))]
+    rpc_public: String,
 }
 
 #[tokio::main]
@@ -78,6 +88,14 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let payer = read_keypair_file(args.payer_keypair.clone()).unwrap();
     let payer = Arc::new(payer);
+
+    let rpc_fallback = RpcFallback::new(
+        &args.endpoint,
+        args.rpc_backup.as_deref(),
+        &args.rpc_public,
+        Arc::clone(&payer),
+    );
+
     let client = Client::new(
         Cluster::Custom(args.endpoint.clone(), args.endpoint.clone()),
         Arc::clone(&payer),
@@ -175,7 +193,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     Ok(last_trading_prices) => {
                         // ignore errors on call since we want to keep executing IX
                         let _ = handlers::update_pool_aum(
-                            &program,
+                            &rpc_fallback,
                             *median_priority_fee.lock().await,
                             last_trading_prices,
                             remaining_accounts.clone(),

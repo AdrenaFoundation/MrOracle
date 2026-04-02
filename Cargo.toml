@@ -41,6 +41,7 @@ adrena-abi = { git = "https://github.com/AdrenaFoundation/adrena-abi.git", rev =
 anchor-client = { git = "https://github.com/coral-xyz/anchor.git", rev = "04536725c2ea16329e84bcfe3200afd47eeeb464", features = [
     "async",
 ] }
+anchor-lang = { git = "https://github.com/coral-xyz/anchor.git", rev = "04536725c2ea16329e84bcfe3200afd47eeeb464" }
 anchor-spl = { git = "https://github.com/coral-xyz/anchor.git", rev = "04536725c2ea16329e84bcfe3200afd47eeeb464" }
 spl-associated-token-account = { version = "6.0.0", features = [
     "no-entrypoint",
