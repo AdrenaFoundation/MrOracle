@@ -1,10 +1,14 @@
 use {
+    anchor_lang::AccountDeserialize,
+    serde::de::DeserializeOwned,
     solana_client::{
         nonblocking::rpc_client::RpcClient,
         rpc_config::RpcSendTransactionConfig,
+        rpc_request::RpcRequest,
     },
     solana_sdk::{
         instruction::Instruction,
+        pubkey::Pubkey,
         signature::{Keypair, Signature},
         signer::Signer,
         transaction::Transaction,
@@ -158,6 +162,82 @@ impl RpcFallback {
 
         log::error!("[{}] All RPCs failed. Please handle ASAP. Critical Priority.", operation);
 
+        Err(anyhow::anyhow!(
+            "[{}] All RPCs failed. Please handle ASAP. Critical Priority.",
+            operation
+        ))
+    }
+
+    /// Fetch and deserialize a typed account with RPC fallback.
+    /// Tries each RPC in order. Deserialization errors are NOT retried
+    /// (data is the same on all RPCs).
+    pub async fn get_account<T: AccountDeserialize>(
+        &self,
+        pubkey: &Pubkey,
+        operation: &str,
+    ) -> Result<T, anyhow::Error> {
+        for endpoint in &self.endpoints {
+            let label_upper = endpoint.label.to_uppercase();
+
+            let account = match timeout(RPC_TIMEOUT, endpoint.client.get_account(pubkey)).await {
+                Ok(Ok(account)) => account,
+                Ok(Err(e)) => {
+                    log::error!("[{}] {} RPC failed: {}", operation, label_upper, e);
+                    continue;
+                }
+                Err(_) => {
+                    log::error!("[{}] {} RPC failed: timed out", operation, label_upper);
+                    continue;
+                }
+            };
+
+            let mut data: &[u8] = &account.data;
+            return T::try_deserialize(&mut data)
+                .map_err(|e| anyhow::anyhow!("[{}] deserialization failed: {}", operation, e));
+        }
+
+        log::error!(
+            "[{}] All RPCs failed. Please handle ASAP. Critical Priority.",
+            operation
+        );
+        Err(anyhow::anyhow!(
+            "[{}] All RPCs failed. Please handle ASAP. Critical Priority.",
+            operation
+        ))
+    }
+
+    /// Send a raw RPC request with fallback.
+    pub async fn send_rpc_request<T: DeserializeOwned>(
+        &self,
+        request: RpcRequest,
+        params: serde_json::Value,
+        operation: &str,
+    ) -> Result<T, anyhow::Error> {
+        for endpoint in &self.endpoints {
+            let label_upper = endpoint.label.to_uppercase();
+
+            match timeout(
+                RPC_TIMEOUT,
+                endpoint.client.send::<T>(request, params.clone()),
+            )
+            .await
+            {
+                Ok(Ok(result)) => return Ok(result),
+                Ok(Err(e)) => {
+                    log::error!("[{}] {} RPC failed: {}", operation, label_upper, e);
+                    continue;
+                }
+                Err(_) => {
+                    log::error!("[{}] {} RPC failed: timed out", operation, label_upper);
+                    continue;
+                }
+            }
+        }
+
+        log::error!(
+            "[{}] All RPCs failed. Please handle ASAP. Critical Priority.",
+            operation
+        );
         Err(anyhow::anyhow!(
             "[{}] All RPCs failed. Please handle ASAP. Critical Priority.",
             operation
