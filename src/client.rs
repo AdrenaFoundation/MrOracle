@@ -42,9 +42,6 @@ struct Args {
     /// Service endpoint
     endpoint: String,
 
-    #[clap(long)]
-    x_token: Option<String>,
-
     /// Commitment level: processed, confirmed or finalized
     #[clap(long)]
     commitment: Option<ArgsCommitment>,
