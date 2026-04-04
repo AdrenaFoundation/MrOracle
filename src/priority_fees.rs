@@ -39,11 +39,9 @@ pub async fn get_recent_prioritization_fees_by_percentile(
         .iter()
         .map(|key| key.to_string())
         .collect();
-    let mut args = vec![serde_json::to_value(accounts)?];
-
-    if let Some(percentile) = config.percentile {
-        args.push(serde_json::to_value(vec![percentile])?);
-    }
+    // Only send the accounts array — the percentile param is a Triton/rpcpool
+    // extension and not supported by standard RPCs (e.g. api.mainnet-beta.solana.com)
+    let args = vec![serde_json::to_value(accounts)?];
 
     let response: Vec<RpcPrioritizationFee> = rpc_fallback
         .send_rpc_request(
