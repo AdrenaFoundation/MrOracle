@@ -7,6 +7,7 @@ use {
         rpc_request::RpcRequest,
     },
     solana_sdk::{
+        commitment_config::CommitmentConfig,
         instruction::Instruction,
         pubkey::Pubkey,
         signature::{Keypair, Signature},
@@ -38,23 +39,28 @@ impl RpcFallback {
         primary_url: &str,
         backup_url: Option<&str>,
         public_url: &str,
+        commitment: CommitmentConfig,
         payer: Arc<Keypair>,
     ) -> Self {
+        let make_client = |url: &str| {
+            RpcClient::new_with_timeout_and_commitment(url.to_string(), RPC_TIMEOUT, commitment)
+        };
+
         let mut endpoints = vec![RpcEndpoint {
             label: "primary",
-            client: RpcClient::new_with_timeout(primary_url.to_string(), RPC_TIMEOUT),
+            client: make_client(primary_url),
         }];
 
         if let Some(url) = backup_url {
             endpoints.push(RpcEndpoint {
                 label: "backup",
-                client: RpcClient::new_with_timeout(url.to_string(), RPC_TIMEOUT),
+                client: make_client(url),
             });
         }
 
         endpoints.push(RpcEndpoint {
             label: "public",
-            client: RpcClient::new_with_timeout(public_url.to_string(), RPC_TIMEOUT),
+            client: make_client(public_url),
         });
 
         Self { endpoints, payer }
@@ -117,29 +123,41 @@ impl RpcFallback {
                 }
             };
 
-            // 4. Confirm — poll for on-chain status
+            // 4. Confirm — poll for on-chain status (each poll wrapped in timeout for predictable worst-case timing)
             let mut confirmed = false;
             for _ in 0..CONFIRM_POLLS {
                 tokio::time::sleep(CONFIRM_INTERVAL).await;
-                match endpoint.client.get_signature_statuses(&[sig]).await {
-                    Ok(response) => {
+                let status_result = timeout(
+                    RPC_TIMEOUT,
+                    endpoint.client.get_signature_statuses(&[sig]),
+                )
+                .await;
+                match status_result {
+                    Ok(Ok(response)) => {
                         if let Some(Some(status)) = response.value.first() {
-                            if status.err.is_none() {
-                                confirmed = true;
-                                break;
-                            } else {
-                                // TX landed but failed on-chain
+                            if let Some(err) = &status.err {
+                                // TX landed but failed on-chain. The error is deterministic
+                                // — retrying on backup/public RPCs will hit the same error
+                                // and just burn more priority fees. Return immediately.
                                 log::error!(
                                     "[{}] {} RPC tx failed on-chain: {:?}",
-                                    operation, label_upper, status.err
+                                    operation, label_upper, err
                                 );
-                                break;
+                                return Err(anyhow::anyhow!(
+                                    "[{}] tx {} failed on-chain: {:?}",
+                                    operation, sig, err
+                                ));
                             }
+                            confirmed = true;
+                            break;
                         }
                         // None = not yet visible, keep polling
                     }
+                    Ok(Err(_)) => {
+                        // RPC error, keep polling
+                    }
                     Err(_) => {
-                        // Can't check status, keep polling
+                        // Timed out, keep polling
                     }
                 }
             }

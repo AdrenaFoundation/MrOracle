@@ -74,13 +74,17 @@ pub async fn get_mean_prioritization_fee_by_percentile(
         return Err("No prioritization fees retrieved".into());
     }
 
-    let sum: u64 = recent_prioritization_fees
+    // Client-side percentile computation (the server-side percentile param is a
+    // Triton-only extension that doesn't work on public RPCs). We take the fee
+    // value at the given percentile (basis points, 10000 = 100%) from a sorted
+    // ascending list. Higher percentile = higher fee = higher priority.
+    let mut fees: Vec<u64> = recent_prioritization_fees
         .iter()
         .map(|fee| fee.prioritization_fee)
-        .sum();
+        .collect();
+    fees.sort_unstable();
 
-    let mean = (sum + recent_prioritization_fees.len() as u64 - 1)
-        / recent_prioritization_fees.len() as u64;
-
-    Ok(mean)
+    let percentile_bps = config.percentile.unwrap_or(5000);
+    let idx = ((fees.len() as u64).saturating_sub(1) * percentile_bps / 10_000) as usize;
+    Ok(fees[idx.min(fees.len() - 1)])
 }

@@ -10,7 +10,7 @@ use {
         signer::keypair::read_keypair_file,
     },
     std::{env, sync::Arc, thread::sleep, time::Duration},
-    tokio::{sync::Mutex, task::JoinHandle, time::interval, time::Instant},
+    tokio::{sync::Mutex, time::interval, time::Instant},
 };
 
 pub mod db;
@@ -35,12 +35,25 @@ enum ArgsCommitment {
     Finalized,
 }
 
+impl From<ArgsCommitment> for solana_sdk::commitment_config::CommitmentConfig {
+    fn from(c: ArgsCommitment) -> Self {
+        use solana_sdk::commitment_config::{CommitmentConfig, CommitmentLevel};
+        CommitmentConfig {
+            commitment: match c {
+                ArgsCommitment::Processed => CommitmentLevel::Processed,
+                ArgsCommitment::Confirmed => CommitmentLevel::Confirmed,
+                ArgsCommitment::Finalized => CommitmentLevel::Finalized,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Parser)]
 #[clap(author, version, about)]
 struct Args {
-    #[clap(short, long, default_value_t = String::from(DEFAULT_ENDPOINT))]
-    /// Service endpoint
-    endpoint: String,
+    #[clap(long, default_value_t = String::from(DEFAULT_ENDPOINT))]
+    /// Primary Solana JSON-RPC endpoint
+    rpc: String,
 
     /// Commitment level: processed, confirmed or finalized
     #[clap(long)]
@@ -77,22 +90,17 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let args = Args::parse();
 
-    let args = args.clone();
-    let mut periodical_priority_fees_fetching_task: Option<JoinHandle<Result<(), anyhow::Error>>> =
-        None;
-
-    // In case it errored out, abort the fee task (will be recreated)
-    if let Some(t) = periodical_priority_fees_fetching_task.take() {
-        t.abort();
-    }
+    let commitment: solana_sdk::commitment_config::CommitmentConfig =
+        args.commitment.unwrap_or_default().into();
 
     let payer = read_keypair_file(args.payer_keypair.clone()).unwrap();
     let payer = Arc::new(payer);
 
     let rpc_fallback = Arc::new(RpcFallback::new(
-        &args.endpoint,
+        &args.rpc,
         args.rpc_backup.as_deref(),
         &args.rpc_public,
+        commitment,
         Arc::clone(&payer),
     ));
 
@@ -128,28 +136,24 @@ async fn main() -> Result<(), anyhow::Error> {
     let median_priority_fee = Arc::new(Mutex::new(0u64));
     // Spawn a task to poll priority fees every 5 seconds
     log::info!("3 - Spawn a task to poll priority fees every 5 seconds...");
-    #[allow(unused_assignments)]
     {
-        periodical_priority_fees_fetching_task = Some({
-            let median_priority_fee = Arc::clone(&median_priority_fee);
-            let rpc_fallback_clone = Arc::clone(&rpc_fallback);
-            tokio::spawn(async move {
-                let mut fee_refresh_interval = interval(PRIORITY_FEE_REFRESH_INTERVAL);
-                loop {
-                    fee_refresh_interval.tick().await;
-                    if let Ok(fee) =
-                        fetch_mean_priority_fee(&rpc_fallback_clone, MEAN_PRIORITY_FEE_PERCENTILE)
-                            .await
-                    {
-                        let mut fee_lock = median_priority_fee.lock().await;
-                        *fee_lock = fee;
-                        log::debug!(
-                                "  <> Updated median priority fee 30th percentile to : {} µLamports / cu",
-                                fee
-                            );
-                    }
+        let median_priority_fee = Arc::clone(&median_priority_fee);
+        let rpc_fallback_clone = Arc::clone(&rpc_fallback);
+        tokio::spawn(async move {
+            let mut fee_refresh_interval = interval(PRIORITY_FEE_REFRESH_INTERVAL);
+            loop {
+                fee_refresh_interval.tick().await;
+                if let Ok(fee) =
+                    fetch_mean_priority_fee(&rpc_fallback_clone, MEAN_PRIORITY_FEE_PERCENTILE).await
+                {
+                    let mut fee_lock = median_priority_fee.lock().await;
+                    *fee_lock = fee;
+                    log::debug!(
+                        "  <> Updated mean priority fee to: {} µLamports / cu",
+                        fee
+                    );
                 }
-            })
+            }
         });
     }
 
@@ -184,10 +188,14 @@ async fn main() -> Result<(), anyhow::Error> {
 
                 match last_trading_prices {
                     Ok(last_trading_prices) => {
+                        // Copy the fee out of the lock BEFORE awaiting the TX send,
+                        // otherwise the MutexGuard is held across the await and blocks
+                        // the priority-fee refresher task for the duration of the send.
+                        let fee = *median_priority_fee.lock().await;
                         // ignore errors on call since we want to keep executing IX
                         let _ = handlers::update_pool_aum(
                             &rpc_fallback,
-                            *median_priority_fee.lock().await,
+                            fee,
                             last_trading_prices,
                             remaining_accounts.clone(),
                         )
