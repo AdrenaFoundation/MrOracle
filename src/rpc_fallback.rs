@@ -18,7 +18,7 @@ use {
 };
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
-const CONFIRM_POLLS: u32 = 2;
+const CONFIRM_POLLS: u32 = 4;
 const CONFIRM_INTERVAL: Duration = Duration::from_millis(500);
 
 pub const DEFAULT_PUBLIC_RPC: &str = "https://api.mainnet-beta.solana.com";
