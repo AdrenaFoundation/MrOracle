@@ -59,7 +59,7 @@ The binary is at `target/release/mroracle`.
 
 | Flag | Required | Default | Description |
 |------|----------|---------|-------------|
-| `--rpc` | Yes | `http://127.0.0.1:10000` | Primary Solana JSON-RPC endpoint (with auth key in URL path) |
+| `--rpc` | No | `http://127.0.0.1:10000` | Primary Solana JSON-RPC endpoint (with auth key in URL path) |
 | `--rpc-backup` | No | — | Backup RPC endpoint (used when primary fails) |
 | `--rpc-public` | No | `https://api.mainnet-beta.solana.com` | Last-resort public RPC |
 | `--payer-keypair` | Yes | — | Path to funded payer keypair JSON |
