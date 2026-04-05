@@ -27,6 +27,7 @@ hex = "0.4.3"
 log = "0.4.17"
 maplit = "1.0.2"
 rust_decimal = { version = "1.32", features = ["tokio-pg"] }
+serde = "1"
 serde_json = "1.0.86"
 solana-sdk = "2.0.18"
 solana-transaction-status = "2.0.18"
@@ -41,6 +42,7 @@ adrena-abi = { git = "https://github.com/AdrenaFoundation/adrena-abi.git", rev =
 anchor-client = { git = "https://github.com/coral-xyz/anchor.git", rev = "04536725c2ea16329e84bcfe3200afd47eeeb464", features = [
     "async",
 ] }
+anchor-lang = { git = "https://github.com/coral-xyz/anchor.git", rev = "04536725c2ea16329e84bcfe3200afd47eeeb464" }
 anchor-spl = { git = "https://github.com/coral-xyz/anchor.git", rev = "04536725c2ea16329e84bcfe3200afd47eeeb464" }
 spl-associated-token-account = { version = "6.0.0", features = [
     "no-entrypoint",

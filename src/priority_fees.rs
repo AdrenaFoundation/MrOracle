@@ -1,10 +1,12 @@
 use {
-    adrena_abi::ADRENA_PROGRAM_ID,
-    anchor_client::Client,
+    crate::rpc_fallback::RpcFallback,
     serde_json,
-    solana_client::rpc_response::RpcPrioritizationFee,
-    solana_sdk::{pubkey::Pubkey, signature::Keypair},
-    std::{error::Error, sync::Arc},
+    solana_client::{
+        rpc_request::RpcRequest,
+        rpc_response::RpcPrioritizationFee,
+    },
+    solana_sdk::pubkey::Pubkey,
+    std::error::Error,
 };
 
 pub struct GetRecentPrioritizationFeesByPercentileConfig {
@@ -14,7 +16,7 @@ pub struct GetRecentPrioritizationFeesByPercentileConfig {
 }
 
 pub async fn fetch_mean_priority_fee(
-    client: &Client<Arc<Keypair>>,
+    rpc_fallback: &RpcFallback,
     percentile: u64,
 ) -> Result<u64, anyhow::Error> {
     let config = GetRecentPrioritizationFeesByPercentileConfig {
@@ -22,13 +24,13 @@ pub async fn fetch_mean_priority_fee(
         fallback: false,
         locked_writable_accounts: vec![], //adrena_abi::MAIN_POOL_ID, adrena_abi::CORTEX_ID],
     };
-    get_mean_prioritization_fee_by_percentile(client, &config, None)
+    get_mean_prioritization_fee_by_percentile(rpc_fallback, &config, None)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to fetch mean priority fee: {:?}", e))
 }
 
 pub async fn get_recent_prioritization_fees_by_percentile(
-    client: &Client<Arc<Keypair>>,
+    rpc_fallback: &RpcFallback,
     config: &GetRecentPrioritizationFeesByPercentileConfig,
     slots_to_return: Option<usize>,
 ) -> Result<Vec<RpcPrioritizationFee>, Box<dyn Error>> {
@@ -37,18 +39,15 @@ pub async fn get_recent_prioritization_fees_by_percentile(
         .iter()
         .map(|key| key.to_string())
         .collect();
-    let mut args = vec![serde_json::to_value(accounts)?];
+    // Only send the accounts array — the percentile param is a Triton/rpcpool
+    // extension and not supported by standard RPCs (e.g. api.mainnet-beta.solana.com)
+    let args = vec![serde_json::to_value(accounts)?];
 
-    if let Some(percentile) = config.percentile {
-        args.push(serde_json::to_value(vec![percentile])?);
-    }
-
-    let response: Vec<RpcPrioritizationFee> = client
-        .program(ADRENA_PROGRAM_ID)?
-        .rpc()
-        .send(
-            solana_client::rpc_request::RpcRequest::GetRecentPrioritizationFees,
+    let response: Vec<RpcPrioritizationFee> = rpc_fallback
+        .send_rpc_request(
+            RpcRequest::GetRecentPrioritizationFees,
             serde_json::Value::from(args),
+            "Priority Fees",
         )
         .await?;
 
@@ -64,24 +63,28 @@ pub async fn get_recent_prioritization_fees_by_percentile(
 }
 
 pub async fn get_mean_prioritization_fee_by_percentile(
-    client: &Client<Arc<Keypair>>,
+    rpc_fallback: &RpcFallback,
     config: &GetRecentPrioritizationFeesByPercentileConfig,
     slots_to_return: Option<usize>,
 ) -> Result<u64, Box<dyn Error>> {
     let recent_prioritization_fees =
-        get_recent_prioritization_fees_by_percentile(client, config, slots_to_return).await?;
+        get_recent_prioritization_fees_by_percentile(rpc_fallback, config, slots_to_return).await?;
 
     if recent_prioritization_fees.is_empty() {
         return Err("No prioritization fees retrieved".into());
     }
 
-    let sum: u64 = recent_prioritization_fees
+    // Client-side percentile computation (the server-side percentile param is a
+    // Triton-only extension that doesn't work on public RPCs). We take the fee
+    // value at the given percentile (basis points, 10000 = 100%) from a sorted
+    // ascending list. Higher percentile = higher fee = higher priority.
+    let mut fees: Vec<u64> = recent_prioritization_fees
         .iter()
         .map(|fee| fee.prioritization_fee)
-        .sum();
+        .collect();
+    fees.sort_unstable();
 
-    let mean = (sum + recent_prioritization_fees.len() as u64 - 1)
-        / recent_prioritization_fees.len() as u64;
-
-    Ok(mean)
+    let percentile_bps = config.percentile.unwrap_or(5000);
+    let idx = ((fees.len() as u64).saturating_sub(1) * percentile_bps / 10_000) as usize;
+    Ok(fees[idx.min(fees.len() - 1)])
 }

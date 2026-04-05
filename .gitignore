@@ -31,3 +31,5 @@ target/*
 payer*.json
 
 combined.pem
+
+.env
