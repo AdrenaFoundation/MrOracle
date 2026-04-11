@@ -22,6 +22,7 @@ dependencies = [
  "anchor-spl",
  "anyhow",
  "backoff",
+ "base64 0.22.1",
  "bincode",
  "borsh 1.5.3",
  "bs58",
@@ -3188,6 +3189,8 @@ dependencies = [
  "chrono",
  "fallible-iterator",
  "postgres-protocol",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -1,31 +1,86 @@
+//! MrOracle release/39 — multi-provider + multi-pool dispatcher.
+//!
+//! High-level flow:
+//!
+//!   ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
+//!   │ chaoslabs    │   │ autonom      │   │ switchboard  │
+//!   │ poller       │   │ poller       │   │ poller       │
+//!   │ (DB read)    │   │ (DB read)    │   │ (DB read)    │
+//!   └──────┬───────┘   └──────┬───────┘   └──────┬───────┘
+//!          │                  │                  │
+//!          └──────────────────┼──────────────────┘
+//!                             │  ProviderUpdate (mpsc)
+//!                             ▼
+//!               ┌─────────────────────────────┐
+//!               │ main dispatch loop          │
+//!               │  - recv(ProviderUpdate)     │
+//!               │  - fan out to each pool     │
+//!               │  - start 5s window on first │
+//!               │    arrival per pool         │
+//!               │  - fire tx when either      │
+//!               │    (a) all required         │
+//!               │        providers present OR │
+//!               │    (b) window expired       │
+//!               └──────────┬──────────────────┘
+//!                          │
+//!                          ▼
+//!                  RpcFallback (from main)
+//!                          │
+//!                          ▼
+//!                       Solana
+//!
+//! Priority fee refresher runs as a separate task, unchanged from main.
+
 use {
-    adrena_abi::{self, Pool},
+    crate::{
+        oracle_poller::run_provider_poller,
+        pool_config::{aggregate_provider_requirements, load_pools_config, PoolRuntime, COLLECTION_WINDOW},
+        priority_fees::fetch_mean_priority_fee,
+        provider_updates::{ProviderKind, ProviderUpdate},
+        providers::{make_autonom_cycle, make_chaoslabs_cycle, make_switchboard_cycle},
+        rpc_fallback::RpcFallback,
+    },
     clap::Parser,
     openssl::ssl::{SslConnector, SslMethod},
     postgres_openssl::MakeTlsConnector,
-    priority_fees::fetch_mean_priority_fee,
-    solana_sdk::{
-        instruction::AccountMeta,
-        pubkey::Pubkey,
-        signer::keypair::read_keypair_file,
+    solana_sdk::{pubkey::Pubkey, signer::keypair::read_keypair_file},
+    std::{env, str::FromStr, sync::Arc, time::Duration},
+    tokio::{
+        sync::{mpsc, Mutex},
+        time::{interval, sleep},
     },
-    std::{env, sync::Arc, thread::sleep, time::Duration},
-    tokio::{sync::Mutex, time::interval, time::Instant},
 };
 
+pub mod adrena_ix;
 pub mod db;
 pub mod handlers;
+pub mod oracle_poller;
+pub mod pool_config;
 pub mod priority_fees;
+pub mod provider_updates;
+pub mod providers;
 pub mod rpc_fallback;
 pub mod utils;
 
-use rpc_fallback::RpcFallback;
-use utils::format_chaos_labs_oracle_entry_to_params::format_chaos_labs_oracle_entry_to_params;
-
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:10000";
 const MEAN_PRIORITY_FEE_PERCENTILE: u64 = 2500; // 25th
-const PRIORITY_FEE_REFRESH_INTERVAL: Duration = Duration::from_secs(5); // seconds
-const UPDATE_AUM_CU_LIMIT: u32 = 120_000;
+const PRIORITY_FEE_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How often the window-expiry check wakes up. 500ms is fine-grained enough
+/// to keep our effective window within (COLLECTION_WINDOW + 500ms) in the
+/// worst case.
+const WINDOW_POLL_TICK: Duration = Duration::from_millis(500);
+
+/// Per-provider poll interval. Default is a balance between DB load and
+/// freshness — matches what MrOracle switchboard branch used.
+const DEFAULT_CHAOSLABS_POLL_MS: u64 = 400;
+const DEFAULT_AUTONOM_POLL_MS: u64 = 2_000;
+const DEFAULT_SWITCHBOARD_POLL_MS: u64 = 2_000;
+
+/// Default Switchboard MAINNET queue. Matches Queue.DEFAULT_MAINNET_KEY in
+/// the on-demand SDK. Overridable via --switchboard-queue-pubkey.
+const DEFAULT_SWITCHBOARD_MAINNET_QUEUE: &str = "A43DyUGA7s8eXPxqEjJY6EBu1KKbNgfxF8h17VAHn13w";
+const DEFAULT_SWITCHBOARD_MAX_AGE_SLOTS: u64 = 150;
 
 #[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
 enum ArgsCommitment {
@@ -51,9 +106,17 @@ impl From<ArgsCommitment> for solana_sdk::commitment_config::CommitmentConfig {
 #[derive(Debug, Clone, Parser)]
 #[clap(author, version, about)]
 struct Args {
-    #[clap(long, default_value_t = String::from(DEFAULT_ENDPOINT))]
     /// Primary Solana JSON-RPC endpoint
+    #[clap(long, default_value_t = String::from(DEFAULT_ENDPOINT))]
     rpc: String,
+
+    /// Backup RPC endpoint URL (optional, used as fallback)
+    #[clap(long)]
+    rpc_backup: Option<String>,
+
+    /// Public RPC endpoint URL (last-resort fallback)
+    #[clap(long, default_value_t = String::from(rpc_fallback::DEFAULT_PUBLIC_RPC))]
+    rpc_public: String,
 
     /// Commitment level: processed, confirmed or finalized
     #[clap(long)]
@@ -63,25 +126,46 @@ struct Args {
     #[clap(long)]
     payer_keypair: String,
 
-    /// DB Url
+    /// Postgres connection string
     #[clap(long)]
     db_string: String,
 
-    /// Combined certificate
+    /// Combined TLS certificate path
     #[clap(long)]
     combined_cert: String,
 
-    /// Backup RPC endpoint URL (optional, used as fallback)
+    /// Pools config JSON — lists each pool + its providers + custodies.
+    /// See pools_config.example.json at repo root.
     #[clap(long)]
-    rpc_backup: Option<String>,
+    pools_config: String,
 
-    /// Public RPC endpoint URL (last-resort fallback)
-    #[clap(long, default_value_t = String::from(rpc_fallback::DEFAULT_PUBLIC_RPC))]
-    rpc_public: String,
+    /// ChaosLabs polling interval in milliseconds
+    #[clap(long, default_value_t = DEFAULT_CHAOSLABS_POLL_MS)]
+    chaoslabs_poll_ms: u64,
+
+    /// Autonom polling interval in milliseconds
+    #[clap(long, default_value_t = DEFAULT_AUTONOM_POLL_MS)]
+    autonom_poll_ms: u64,
+
+    /// Switchboard polling interval in milliseconds
+    #[clap(long, default_value_t = DEFAULT_SWITCHBOARD_POLL_MS)]
+    switchboard_poll_ms: u64,
+
+    /// Switchboard feed map JSON path (required if any pool uses switchboard)
+    #[clap(long)]
+    switchboard_feed_map_path: Option<String>,
+
+    /// Switchboard queue pubkey (mainnet default if omitted)
+    #[clap(long, default_value_t = String::from(DEFAULT_SWITCHBOARD_MAINNET_QUEUE))]
+    switchboard_queue_pubkey: String,
+
+    /// Switchboard max age in slots for the on-chain staleness gate
+    #[clap(long, default_value_t = DEFAULT_SWITCHBOARD_MAX_AGE_SLOTS)]
+    switchboard_max_age_slots: u64,
 }
 
 #[tokio::main]
-async fn main() -> Result<(), anyhow::Error> {
+async fn main() -> anyhow::Result<()> {
     env::set_var(
         env_logger::DEFAULT_FILTER_ENV,
         env::var_os(env_logger::DEFAULT_FILTER_ENV).unwrap_or_else(|| "info".into()),
@@ -90,10 +174,13 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let args = Args::parse();
 
+    log::info!("MrOracle release/39 — multi-provider dispatcher starting");
+
     let commitment: solana_sdk::commitment_config::CommitmentConfig =
         args.commitment.unwrap_or_default().into();
 
-    let payer = read_keypair_file(args.payer_keypair.clone()).unwrap();
+    let payer = read_keypair_file(args.payer_keypair.clone())
+        .map_err(|e| anyhow::anyhow!("read payer keypair: {e:?}"))?;
     let payer = Arc::new(payer);
 
     let rpc_fallback = Arc::new(RpcFallback::new(
@@ -104,38 +191,57 @@ async fn main() -> Result<(), anyhow::Error> {
         Arc::clone(&payer),
     ));
 
-    // ////////////////////////////////////////////////////////////////
-    // DB CONNECTION POOL
-    // ////////////////////////////////////////////////////////////////
+    log::info!("payer={}", payer.pubkey_string());
+
+    // ────────────────────────────────────────────────────────────────
+    // Load pools config
+    // ────────────────────────────────────────────────────────────────
+    let pools: Vec<Arc<PoolRuntime>> = load_pools_config(&args.pools_config)?
+        .into_iter()
+        .map(Arc::new)
+        .collect();
+
+    for pool in &pools {
+        log::info!(
+            "pool `{}` address={} providers={:?} custodies={} cu_limit={}",
+            pool.name,
+            pool.address,
+            pool.required_providers,
+            pool.custody_accounts.len(),
+            pool.cu_limit,
+        );
+    }
+
+    let required_providers = aggregate_provider_requirements(&pools);
+    log::info!("required providers across all pools: {:?}", required_providers);
+
+    // ────────────────────────────────────────────────────────────────
+    // DB pool
+    // ────────────────────────────────────────────────────────────────
     let mut ssl_builder = SslConnector::builder(SslMethod::tls()).unwrap();
-    ssl_builder.set_ca_file(&args.combined_cert).map_err(|e| {
-        log::error!("Failed to set CA file: {}", e);
-        anyhow::anyhow!("Failed to set CA file: {}", e)
-    })?;
+    ssl_builder
+        .set_ca_file(&args.combined_cert)
+        .map_err(|e| anyhow::anyhow!("set_ca_file: {e}"))?;
     let tls_connector = MakeTlsConnector::new(ssl_builder.build());
 
     let mut db_config = args.db_string.parse::<tokio_postgres::Config>()?;
-
-    // Add connection timeout and keepalive settings
-    db_config.connect_timeout(Duration::from_secs(2)); // Fast timeout for 3s cycle, connection should be established in less than 2s
+    db_config.connect_timeout(Duration::from_secs(2));
     db_config.keepalives(true);
-    db_config.keepalives_idle(Duration::from_secs(6)); // Check connection health after 6s of inactivity, should not happen considering 3s cycles but it is better to be safe
+    db_config.keepalives_idle(Duration::from_secs(6));
 
     let mgr_config = deadpool_postgres::ManagerConfig {
         recycling_method: deadpool_postgres::RecyclingMethod::Fast,
     };
     let mgr = deadpool_postgres::Manager::from_config(db_config, tls_connector, mgr_config);
     let db_pool = deadpool_postgres::Pool::builder(mgr)
-        .max_size(1) // Single connection - only one query at a time
+        .max_size(4) // 3 pollers + 1 misc
         .build()
-        .map_err(|e| anyhow::anyhow!("Failed to create DB pool: {:?}", e))?;
+        .map_err(|e| anyhow::anyhow!("build deadpool: {e:?}"))?;
 
-    // ////////////////////////////////////////////////////////////////
-    // Side thread to fetch the median priority fee every 5 seconds
-    // ////////////////////////////////////////////////////////////////
+    // ────────────────────────────────────────────────────────────────
+    // Priority fee refresher (unchanged from main)
+    // ────────────────────────────────────────────────────────────────
     let median_priority_fee = Arc::new(Mutex::new(0u64));
-    // Spawn a task to poll priority fees every 5 seconds
-    log::info!("3 - Spawn a task to poll priority fees every 5 seconds...");
     {
         let median_priority_fee = Arc::clone(&median_priority_fee);
         let rpc_fallback_clone = Arc::clone(&rpc_fallback);
@@ -148,76 +254,149 @@ async fn main() -> Result<(), anyhow::Error> {
                 {
                     let mut fee_lock = median_priority_fee.lock().await;
                     *fee_lock = fee;
-                    log::debug!(
-                        "  <> Updated mean priority fee to: {} µLamports / cu",
-                        fee
-                    );
+                    log::debug!("  <> Updated mean priority fee to: {fee} µLamports / cu");
                 }
             }
         });
     }
 
-    let pool = rpc_fallback
-        .get_account::<Pool>(&adrena_abi::MAIN_POOL_ID, "Pool Fetch")
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to get pool: {:?}", e))?;
+    // ────────────────────────────────────────────────────────────────
+    // Spawn provider pollers
+    // ────────────────────────────────────────────────────────────────
+    let (update_tx, mut update_rx) = mpsc::channel::<ProviderUpdate>(64);
 
-    let mut custodies_accounts: Vec<AccountMeta> = vec![];
-    for key in pool.custodies.iter() {
-        if key != &Pubkey::default() {
-            custodies_accounts.push(AccountMeta {
-                pubkey: key.clone(),
-                is_signer: false,
-                is_writable: false,
-            });
-        }
+    if required_providers.contains(&ProviderKind::ChaosLabs) {
+        let sender = update_tx.clone();
+        let cycle = make_chaoslabs_cycle(db_pool.clone());
+        let poll = Duration::from_millis(args.chaoslabs_poll_ms);
+        tokio::spawn(async move {
+            run_provider_poller("chaoslabs", poll, cycle, sender).await;
+        });
     }
 
-    let remaining_accounts = [custodies_accounts].concat();
+    if required_providers.contains(&ProviderKind::Autonom) {
+        let sender = update_tx.clone();
+        let cycle = make_autonom_cycle(db_pool.clone());
+        let poll = Duration::from_millis(args.autonom_poll_ms);
+        tokio::spawn(async move {
+            run_provider_poller("autonom", poll, cycle, sender).await;
+        });
+    }
 
-    // ////////////////////////////////////////////////////////////////
-    // CORE LOOP
-    // - call updateAum IX to update Oracle and ALP prices onchain
-    // ////////////////////////////////////////////////////////////////
+    if required_providers.contains(&ProviderKind::Switchboard) {
+        let feed_map_path = args
+            .switchboard_feed_map_path
+            .as_deref()
+            .ok_or_else(|| {
+                anyhow::anyhow!("--switchboard-feed-map-path is required when any pool uses switchboard")
+            })?;
+        let queue_pubkey = Pubkey::from_str(&args.switchboard_queue_pubkey).map_err(|e| {
+            anyhow::anyhow!("invalid --switchboard-queue-pubkey: {e}")
+        })?;
+        let sb_config = providers::switchboard::load_switchboard_feed_map(
+            feed_map_path,
+            queue_pubkey,
+            args.switchboard_max_age_slots,
+        )?;
+        log::info!(
+            "switchboard: queue={} feeds={} max_age_slots={}",
+            sb_config.queue_pubkey,
+            sb_config.feed_map.len(),
+            sb_config.max_age_slots,
+        );
+        let sender = update_tx.clone();
+        let cycle = make_switchboard_cycle(db_pool.clone(), sb_config);
+        let poll = Duration::from_millis(args.switchboard_poll_ms);
+        tokio::spawn(async move {
+            run_provider_poller("switchboard", poll, cycle, sender).await;
+        });
+    }
+
+    // Drop the original sender so the receiver sees EOF if every poller dies.
+    drop(update_tx);
+
+    // ────────────────────────────────────────────────────────────────
+    // Main dispatch loop
+    //
+    // On each tick:
+    //   1. Drain up to 64 queued ProviderUpdates (non-blocking). Distribute
+    //      each to every pool whose required_providers contains its kind.
+    //   2. Scan all pools for fire conditions (complete OR window expired).
+    //   3. Fire fire_update_pool_aum for each pool that's ready.
+    //   4. Sleep WINDOW_POLL_TICK (500ms) and loop.
+    // ────────────────────────────────────────────────────────────────
     loop {
-        let start = Instant::now();
-        let assets_prices = db::get_assets_prices::get_assets_prices(&db_pool).await;
-        match assets_prices {
-            Ok(Some(assets_prices)) => {
-                let last_trading_prices = format_chaos_labs_oracle_entry_to_params(&assets_prices);
-
-                match last_trading_prices {
-                    Ok(last_trading_prices) => {
-                        // Copy the fee out of the lock BEFORE awaiting the TX send,
-                        // otherwise the MutexGuard is held across the await and blocks
-                        // the priority-fee refresher task for the duration of the send.
-                        let fee = *median_priority_fee.lock().await;
-                        // ignore errors on call since we want to keep executing IX
-                        let _ = handlers::update_pool_aum(
-                            &rpc_fallback,
-                            fee,
-                            last_trading_prices,
-                            remaining_accounts.clone(),
-                        )
-                        .await;
-                    }
-                    Err(e) => {
-                        log::error!("Error formatting assets prices: {:?}", e);
+        // Drain the channel without blocking: if there's nothing right now,
+        // recv() returns None via try_recv so we move on to the window check.
+        loop {
+            match update_rx.try_recv() {
+                Ok(update) => {
+                    let kind = update.kind();
+                    log::debug!("dispatch: received {:?} update", kind);
+                    for pool in &pools {
+                        if !pool.required_providers.contains(&kind) {
+                            continue;
+                        }
+                        let mut pending = pool.pending.lock().await;
+                        pending.ingest(update.clone());
                     }
                 }
-            }
-            Ok(None) => {
-                log::warn!("No assets prices found in DB - Sleeping 500ms");
-            }
-            Err(e) => {
-                log::error!("Database query error: {:?} - Sleeping 500ms", e);
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    log::error!("all provider pollers stopped, exiting main loop");
+                    return Err(anyhow::anyhow!("provider channel disconnected"));
+                }
             }
         }
 
-        let elapsed = start.elapsed();
-        let sleep_duration = Duration::from_secs(5).saturating_sub(elapsed);
-        if sleep_duration > Duration::from_millis(0) {
-            sleep(sleep_duration);
+        // Fire any ready pools.
+        for pool in &pools {
+            let should_fire;
+            let snapshot_opt;
+            {
+                let mut pending = pool.pending.lock().await;
+                let complete = pending.is_complete(&pool.required_providers);
+                let expired = pending.is_window_expired(COLLECTION_WINDOW);
+                if complete || (expired && pending.has_anything()) {
+                    snapshot_opt = Some(pending.take_snapshot());
+                    should_fire = true;
+                } else {
+                    snapshot_opt = None;
+                    should_fire = false;
+                }
+            }
+
+            if should_fire {
+                let snapshot = snapshot_opt.unwrap();
+                let fee = *median_priority_fee.lock().await;
+                let rpc_fallback = Arc::clone(&rpc_fallback);
+                let pool = Arc::clone(pool);
+                // Fire-and-forget: run the send on a fresh task so a slow
+                // send on one pool doesn't hold up the dispatch loop for
+                // other pools.
+                tokio::spawn(async move {
+                    if let Err(err) =
+                        handlers::fire_update_pool_aum(&rpc_fallback, &pool, snapshot, fee).await
+                    {
+                        log::error!("[{}] fire_update_pool_aum failed: {err:#}", pool.name);
+                    }
+                });
+            }
         }
+
+        sleep(WINDOW_POLL_TICK).await;
+    }
+}
+
+// ── Small helper: extend Keypair with pubkey_string for log formatting.
+//    Avoids a chain of `.pubkey().to_string()` calls at the log sites.
+trait KeypairPubkeyString {
+    fn pubkey_string(&self) -> String;
+}
+
+impl KeypairPubkeyString for solana_sdk::signature::Keypair {
+    fn pubkey_string(&self) -> String {
+        use solana_sdk::signer::Signer;
+        self.pubkey().to_string()
     }
 }

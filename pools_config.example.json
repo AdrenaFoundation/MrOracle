@@ -1,0 +1,18 @@
+{
+  "_note": "Operator config for MrOracle release/39. Each pool entry must list the custody pubkeys in the exact order of pool.custodies[] on-chain (ops can query via `adrena cli pool get`). The providers array drives which DB pollers are required and which provider batches must be collected before firing update_pool_aum. The 5-second collection window is hardcoded in src/pool_config.rs (COLLECTION_WINDOW).",
+  "pools": [
+    {
+      "name": "main-pool",
+      "_address_comment": "Mainnet main-pool PDA. Custody order matches pool.custodies[]: [USDC, BONK, jitoSOL, WBTC].",
+      "address": "4bQRutgDJs6vuh6ZcWaPVXiQaBzbHketjbCDjL4oRN34",
+      "providers": ["chaoslabs", "autonom", "switchboard"],
+      "custodies": [
+        "Dk523LZeDQbZtUwPEBjFXCd2Au1tD7mWZBJJmcgHktNk",
+        "8aJuzsgjxBnvRhDcfQBD7z4CUj7QoPEpaNwVd7KqsSk5",
+        "GZ9XfWwgTRhkma2Y91Q9r1XKotNXYjBnKKabj19rhT71",
+        "GFu3qS22mo6bAjg4Lr5R7L8pPgHq6GvbjJPKEHkbbs2c"
+      ],
+      "cu_limit": 1400000
+    }
+  ]
+}

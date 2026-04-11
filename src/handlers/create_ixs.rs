@@ -1,30 +1,33 @@
+//! Thin wrapper around `adrena_ix::build_update_pool_aum_ix`. Kept as its own
+//! module to mirror main's layout, making the release/39 diff easier to read.
+
 use {
-    adrena_abi::{oracle::ChaosLabsBatchPrices, ALP_MINT, CORTEX_ID, MAIN_POOL_ID},
-    solana_sdk::pubkey::Pubkey,
+    crate::adrena_ix::{
+        build_update_pool_aum_ix, BatchPrices, MultiBatchPrices, SwitchboardUpdateParams,
+    },
+    solana_sdk::{
+        instruction::{AccountMeta, Instruction},
+        pubkey::Pubkey,
+    },
 };
 
+#[allow(clippy::too_many_arguments)]
 pub fn create_update_pool_aum_ix(
     payer: &Pubkey,
-    last_trading_prices: Option<ChaosLabsBatchPrices>,
-) -> (
-    adrena_abi::instruction::UpdatePoolAum,
-    adrena_abi::accounts::UpdatePoolAum,
-) {
-    let oracle_pda = adrena_abi::pda::get_oracle_pda().0;
-
-    let args = adrena_abi::instruction::UpdatePoolAum {
-        params: adrena_abi::types::UpdatePoolAumParams {
-            oracle_prices: last_trading_prices,
-        },
-    };
-
-    let accounts = adrena_abi::accounts::UpdatePoolAum {
-        payer: *payer,
-        cortex: CORTEX_ID,
-        pool: MAIN_POOL_ID,
-        oracle: oracle_pda,
-        lp_token_mint: ALP_MINT,
-    };
-
-    (args, accounts)
+    pool_pubkey: Pubkey,
+    oracle_prices: Option<BatchPrices>,
+    multi_oracle_prices: Option<MultiBatchPrices>,
+    switchboard_oracle_prices: Option<SwitchboardUpdateParams>,
+    quote_account: Option<Pubkey>,
+    custody_accounts: &[AccountMeta],
+) -> anyhow::Result<Instruction> {
+    build_update_pool_aum_ix(
+        payer,
+        pool_pubkey,
+        oracle_prices,
+        multi_oracle_prices,
+        switchboard_oracle_prices,
+        quote_account,
+        custody_accounts,
+    )
 }
