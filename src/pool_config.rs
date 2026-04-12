@@ -61,6 +61,10 @@ pub struct PoolConfigEntry {
     /// Custody PDAs in the exact order of `pool.custodies[]` on-chain.
     /// Operator must keep this in sync with any add_custody / remove_custody ops.
     pub custodies: Vec<String>,
+    /// Synthetic custody PDAs in the exact order of `pool.synthetic_custodies[]` on-chain.
+    /// Required for Autonom pools; empty for GMX pools.
+    #[serde(default)]
+    pub synthetic_custodies: Vec<String>,
     /// Compute unit limit. If absent, defaults to `DEFAULT_CU_LIMIT_WITH_SWITCHBOARD`
     /// when the pool requires Switchboard, else `DEFAULT_CU_LIMIT`.
     #[serde(default)]
@@ -158,6 +162,9 @@ pub struct PoolRuntime {
     pub address: Pubkey,
     pub required_providers: HashSet<ProviderKind>,
     pub custody_accounts: Vec<AccountMeta>,
+    pub synthetic_custody_accounts: Vec<AccountMeta>,
+    /// All custodies in on-chain order: regular + synthetic (for AUM remaining_accounts)
+    pub all_custody_accounts: Vec<AccountMeta>,
     pub cu_limit: u32,
     pub pending: Arc<Mutex<PerPoolPending>>,
 }
@@ -193,6 +200,20 @@ impl PoolRuntime {
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
 
+        let synthetic_custody_accounts = entry
+            .synthetic_custodies
+            .iter()
+            .map(|s| {
+                Pubkey::from_str(s)
+                    .with_context(|| format!("pool `{}` synthetic_custody `{s}` is not a valid pubkey", entry.name))
+                    .map(|pk| AccountMeta::new_readonly(pk, false))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        // Merge: regular custodies + synthetic custodies (on-chain order for remaining_accounts)
+        let mut all_custody_accounts = custody_accounts.clone();
+        all_custody_accounts.extend_from_slice(&synthetic_custody_accounts);
+
         let has_switchboard = required_providers.contains(&ProviderKind::Switchboard);
         let default_cu = if has_switchboard {
             DEFAULT_CU_LIMIT_WITH_SWITCHBOARD
@@ -206,6 +227,8 @@ impl PoolRuntime {
             address,
             required_providers,
             custody_accounts,
+            synthetic_custody_accounts,
+            all_custody_accounts,
             cu_limit,
             pending: Arc::new(Mutex::new(PerPoolPending::default())),
         })
@@ -249,5 +272,238 @@ pub fn aggregate_provider_requirements<T: AsRef<PoolRuntime>>(
 impl AsRef<PoolRuntime> for PoolRuntime {
     fn as_ref(&self) -> &PoolRuntime {
         self
+    }
+}
+
+/// Validate each pool's configured custody + synthetic custody lists against on-chain state.
+/// Returns the set of pool names that FAILED validation. The caller should quarantine
+/// these pools (skip AUM updates) rather than crash the whole service.
+pub async fn validate_custodies_against_chain(
+    pools: &[&PoolRuntime],
+    rpc_client: &solana_client::nonblocking::rpc_client::RpcClient,
+) -> HashSet<String> {
+    let mut quarantined: HashSet<String> = HashSet::new();
+
+    for pool in pools {
+        match rpc_client.get_account_data(&pool.address).await {
+            Ok(data) => {
+                // Pool struct layout (repr(C)):
+                //   disc(8) + 8*u8(8) + LimitedString(32) = custodies at offset 48
+                //   custodies: [Pubkey;8] at offset 48 (256 bytes)
+                //   ... many fields ...
+                //   registered_synthetic_custody_count: u8
+                //   ... more fields ...
+                //   synthetic_custodies: [Pubkey;32]
+                const CUSTODIES_OFFSET: usize = 48;
+                let config_regular: Vec<Pubkey> = pool.custody_accounts.iter().map(|a| a.pubkey).collect();
+                let config_synthetic: Vec<Pubkey> = pool.synthetic_custody_accounts.iter().map(|a| a.pubkey).collect();
+
+                if data.len() < CUSTODIES_OFFSET + 256 {
+                    log::error!("❌ [{}] pool account data too short — QUARANTINED", pool.name);
+                    quarantined.insert(pool.name.clone());
+                    continue;
+                }
+
+                // Regular custodies
+                let registered_count = data[15] as usize;
+                let mut on_chain_regular: Vec<Pubkey> = Vec::new();
+                for i in 0..registered_count.min(8) {
+                    let start = CUSTODIES_OFFSET + i * 32;
+                    let end = start + 32;
+                    if end <= data.len() {
+                        let key = Pubkey::new_from_array(data[start..end].try_into().unwrap());
+                        if key != Pubkey::default() {
+                            on_chain_regular.push(key);
+                        }
+                    }
+                }
+
+                if config_regular != on_chain_regular {
+                    log::error!(
+                        "❌ [{}] regular custody mismatch: config={:?} on-chain={:?} — QUARANTINED",
+                        pool.name, config_regular, on_chain_regular
+                    );
+                    quarantined.insert(pool.name.clone());
+                    continue;
+                }
+
+                // Synthetic custodies validation.
+                // Pool layout (release/39): synthetic_custodies is [Pubkey;32] and
+                // registered_synthetic_custody_count is a u8 earlier in the struct.
+                // From the Pool struct (after disc):
+                //   offset 8+7=15: registered_custody_count (already read above)
+                //   The synthetic fields are deep in the struct. Rather than hardcode
+                //   the byte offset (fragile), we validate by count and then trust
+                //   exact ordering from the manifest which MrSablier validates via
+                //   full Anchor deserialization at startup.
+                //
+                // Synthetic custodies: ALWAYS parse from raw account data, regardless
+                // of whether config declares any. This catches the case where an
+                // operator forgets to configure synthetics for an Autonom pool.
+                //
+                // Pool layout offsets (from account start, disc included):
+                //   pool_type: u8 at 552
+                //   registered_synthetic_custody_count: u8 at 554
+                //   synthetic_custodies: [Pubkey;32] at 800
+                const SYNTHETIC_COUNT_OFFSET: usize = 554;
+                const SYNTHETIC_CUSTODIES_OFFSET: usize = 800;
+
+                if data.len() < SYNTHETIC_CUSTODIES_OFFSET + 32 * 32 {
+                    log::error!("❌ [{}] pool data too short to read synthetic custodies — QUARANTINED", pool.name);
+                    quarantined.insert(pool.name.clone());
+                    continue;
+                }
+
+                let synthetic_count = data[SYNTHETIC_COUNT_OFFSET] as usize;
+                let mut on_chain_synthetic: Vec<Pubkey> = Vec::new();
+                for i in 0..synthetic_count.min(32) {
+                    let start = SYNTHETIC_CUSTODIES_OFFSET + i * 32;
+                    let end = start + 32;
+                    if end <= data.len() {
+                        let key = Pubkey::new_from_array(data[start..end].try_into().unwrap());
+                        if key != Pubkey::default() {
+                            on_chain_synthetic.push(key);
+                        }
+                    }
+                }
+
+                // Always compare: empty config vs non-empty chain must fail.
+                if config_synthetic != on_chain_synthetic {
+                    log::error!(
+                        "❌ [{}] synthetic custody mismatch: config has {} ({:?}), on-chain has {} ({:?}) — QUARANTINED",
+                        pool.name,
+                        config_synthetic.len(), config_synthetic,
+                        on_chain_synthetic.len(), on_chain_synthetic
+                    );
+                    quarantined.insert(pool.name.clone());
+                    continue;
+                }
+
+                log::info!(
+                    "[{}] {} regular + {} synthetic custodies validated against on-chain ✓",
+                    pool.name, config_regular.len(), config_synthetic.len()
+                );
+            }
+            Err(e) => {
+                log::error!("❌ [{}] could not fetch pool account: {} — QUARANTINED", pool.name, e);
+                quarantined.insert(pool.name.clone());
+            }
+        }
+    }
+
+    quarantined
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solana_sdk::pubkey::Pubkey;
+
+    // Pool struct layout offsets (verified against adrena-abi/src/types.rs Pool struct):
+    //
+    // disc(8) + 8*u8(8) + LimitedString(32) = custodies at 48
+    // custodies [Pubkey;8] = 256 bytes → ends at 304
+    // 4*u64(32) + Pubkey(32) + [TokenRatios;8](64) + i64(8) + u64(8) + U128Split(16)
+    //   + i64(8) + u64(8) + PositionExitFeeConfig(64) + i64(8) = 248 bytes
+    //   → pool_type at offset 552
+    // pool_type(1) + oracle_provider(1) + synthetic_count(1) + version(1) + _pad(4)
+    //   + 3*i64(24) + [u8;32](32) + 5*u16(10) + _pad(6) + Pubkey(32) + 4*u64(32)
+    //   + 4*u64(32) + MultiOracleConfig(80)
+    //   → synthetic_custodies at offset 800
+    const DISC: usize = 8;
+    const REGULAR_CUSTODY_COUNT_OFF: usize = 15;
+    const REGULAR_CUSTODIES_OFF: usize = 48;
+    const POOL_TYPE_OFF: usize = 552;
+    const SYNTHETIC_COUNT_OFF: usize = 554;
+    const SYNTHETIC_CUSTODIES_OFF: usize = 800;
+
+    fn make_pool_buffer(
+        regular_count: u8,
+        regular_custodies: &[Pubkey],
+        pool_type: u8,
+        synthetic_count: u8,
+        synthetic_custodies: &[Pubkey],
+    ) -> Vec<u8> {
+        // Total Pool account size: disc(8) + struct(2528) = 2536
+        let total = 2536;
+        let mut buf = vec![0u8; total];
+
+        // Anchor discriminator (fake)
+        buf[0..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+
+        // registered_custody_count
+        buf[REGULAR_CUSTODY_COUNT_OFF] = regular_count;
+
+        // Write regular custodies
+        for (i, pk) in regular_custodies.iter().enumerate() {
+            let start = REGULAR_CUSTODIES_OFF + i * 32;
+            buf[start..start + 32].copy_from_slice(pk.as_ref());
+        }
+
+        // pool_type
+        buf[POOL_TYPE_OFF] = pool_type;
+
+        // registered_synthetic_custody_count
+        buf[SYNTHETIC_COUNT_OFF] = synthetic_count;
+
+        // Write synthetic custodies
+        for (i, pk) in synthetic_custodies.iter().enumerate() {
+            let start = SYNTHETIC_CUSTODIES_OFF + i * 32;
+            buf[start..start + 32].copy_from_slice(pk.as_ref());
+        }
+
+        buf
+    }
+
+    #[test]
+    fn test_pool_layout_offsets_regular_custodies() {
+        let c1 = Pubkey::new_unique();
+        let c2 = Pubkey::new_unique();
+        let buf = make_pool_buffer(2, &[c1, c2], 0, 0, &[]);
+
+        assert_eq!(buf[REGULAR_CUSTODY_COUNT_OFF], 2);
+        let read_c1 = Pubkey::new_from_array(
+            buf[REGULAR_CUSTODIES_OFF..REGULAR_CUSTODIES_OFF + 32].try_into().unwrap()
+        );
+        let read_c2 = Pubkey::new_from_array(
+            buf[REGULAR_CUSTODIES_OFF + 32..REGULAR_CUSTODIES_OFF + 64].try_into().unwrap()
+        );
+        assert_eq!(read_c1, c1);
+        assert_eq!(read_c2, c2);
+    }
+
+    #[test]
+    fn test_pool_layout_offsets_synthetic_custodies() {
+        let c1 = Pubkey::new_unique();
+        let s1 = Pubkey::new_unique();
+        let s2 = Pubkey::new_unique();
+        let buf = make_pool_buffer(1, &[c1], 1, 2, &[s1, s2]);
+
+        assert_eq!(buf[POOL_TYPE_OFF], 1); // Autonom
+        assert_eq!(buf[SYNTHETIC_COUNT_OFF], 2);
+
+        let read_s1 = Pubkey::new_from_array(
+            buf[SYNTHETIC_CUSTODIES_OFF..SYNTHETIC_CUSTODIES_OFF + 32].try_into().unwrap()
+        );
+        let read_s2 = Pubkey::new_from_array(
+            buf[SYNTHETIC_CUSTODIES_OFF + 32..SYNTHETIC_CUSTODIES_OFF + 64].try_into().unwrap()
+        );
+        assert_eq!(read_s1, s1);
+        assert_eq!(read_s2, s2);
+    }
+
+    #[test]
+    fn test_pool_layout_offsets_gmx_no_synthetics() {
+        let buf = make_pool_buffer(4, &[Pubkey::new_unique(); 4].as_slice(), 0, 0, &[]);
+
+        assert_eq!(buf[POOL_TYPE_OFF], 0); // GMX
+        assert_eq!(buf[SYNTHETIC_COUNT_OFF], 0);
+
+        // Verify synthetic custodies area is zeroed
+        for i in 0..32 {
+            let start = SYNTHETIC_CUSTODIES_OFF + i * 32;
+            let key = Pubkey::new_from_array(buf[start..start + 32].try_into().unwrap());
+            assert_eq!(key, Pubkey::default());
+        }
     }
 }

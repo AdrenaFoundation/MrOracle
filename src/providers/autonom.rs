@@ -83,13 +83,26 @@ pub fn make_autonom_cycle(db_pool: DbPool) -> CycleFn {
     })
 }
 
+/// Same sanity bounds as chaoslabs.rs — prices at 1e10 scale.
+const PRICE_SANITY_MIN: u64 = 1;
+const PRICE_SANITY_MAX: u64 = 100_000_000_000_000_000; // 1e17 = $10M at 1e10 scale
+
 fn decimal_to_u64(d: &rust_decimal::Decimal) -> anyhow::Result<u64> {
     if d.is_sign_negative() {
         return Err(anyhow!("negative price"));
     }
     let trunc = d.trunc();
     use rust_decimal::prelude::ToPrimitive;
-    trunc
+    let value = trunc
         .to_u64()
-        .ok_or_else(|| anyhow!("price {} does not fit u64", d))
+        .ok_or_else(|| anyhow!("price {} does not fit u64", d))?;
+
+    if value < PRICE_SANITY_MIN || value > PRICE_SANITY_MAX {
+        return Err(anyhow!(
+            "price {} outside sanity bounds [{}, {}]",
+            value, PRICE_SANITY_MIN, PRICE_SANITY_MAX
+        ));
+    }
+
+    Ok(value)
 }

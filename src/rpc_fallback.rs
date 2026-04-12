@@ -70,6 +70,11 @@ impl RpcFallback {
         self.payer.pubkey()
     }
 
+    /// Borrow the primary RPC client for one-off reads (e.g. startup validation).
+    pub fn primary_client(&self) -> &RpcClient {
+        &self.endpoints[0].client
+    }
+
     /// Build, sign, send, and confirm a transaction with RPC fallback.
     /// Tries each RPC in order (primary -> backup -> public).
     /// Per endpoint: get blockhash -> sign -> send -> confirm.
@@ -80,8 +85,48 @@ impl RpcFallback {
         config: RpcSendTransactionConfig,
         operation: &str,
     ) -> Result<Signature, anyhow::Error> {
+        // Track whether we successfully sent a TX on any endpoint.
+        // If primary sent but didn't confirm, we still return it — oracle updates
+        // are idempotent and the next poll window will send fresh data anyway.
+        // This prevents the backup from sending a DIFFERENT TX (new blockhash)
+        // that could land alongside the primary's, wasting CU.
+        let mut sent_sig: Option<(Signature, &str)> = None;
+
         for endpoint in &self.endpoints {
             let label_upper = endpoint.label.to_uppercase();
+
+            // If a prior endpoint already sent a TX, don't re-send from a
+            // different endpoint (different blockhash = different TX = potential
+            // double-land). Just try to confirm the already-sent TX on this endpoint.
+            if let Some((prior_sig, prior_label)) = &sent_sig {
+                let mut confirmed = false;
+                for _ in 0..CONFIRM_POLLS {
+                    tokio::time::sleep(CONFIRM_INTERVAL).await;
+                    if let Ok(Ok(response)) = timeout(
+                        RPC_TIMEOUT,
+                        endpoint.client.get_signature_statuses(&[*prior_sig]),
+                    ).await {
+                        if let Some(Some(status)) = response.value.first() {
+                            if let Some(err) = &status.err {
+                                return Err(anyhow::anyhow!(
+                                    "[{}] tx {} (sent via {}) failed on-chain: {:?}",
+                                    operation, prior_sig, prior_label, err
+                                ));
+                            }
+                            confirmed = true;
+                            break;
+                        }
+                    }
+                }
+                if confirmed {
+                    log::info!(
+                        "[{}] TX {} (sent via {}) confirmed via {} RPC",
+                        operation, prior_sig, prior_label, label_upper
+                    );
+                    return Ok(*prior_sig);
+                }
+                continue;
+            }
 
             // 1. Get blockhash
             let blockhash = match timeout(RPC_TIMEOUT, endpoint.client.get_latest_blockhash()).await
@@ -123,7 +168,10 @@ impl RpcFallback {
                 }
             };
 
-            // 4. Confirm — poll for on-chain status (each poll wrapped in timeout for predictable worst-case timing)
+            // Mark as sent — subsequent endpoints will only try to confirm, not re-send.
+            sent_sig = Some((sig, endpoint.label));
+
+            // 4. Confirm
             let mut confirmed = false;
             for _ in 0..CONFIRM_POLLS {
                 tokio::time::sleep(CONFIRM_INTERVAL).await;
@@ -136,9 +184,6 @@ impl RpcFallback {
                     Ok(Ok(response)) => {
                         if let Some(Some(status)) = response.value.first() {
                             if let Some(err) = &status.err {
-                                // TX landed but failed on-chain. The error is deterministic
-                                // — retrying on backup/public RPCs will hit the same error
-                                // and just burn more priority fees. Return immediately.
                                 log::error!(
                                     "[{}] {} RPC tx failed on-chain: {:?}",
                                     operation, label_upper, err
@@ -151,14 +196,9 @@ impl RpcFallback {
                             confirmed = true;
                             break;
                         }
-                        // None = not yet visible, keep polling
                     }
-                    Ok(Err(_)) => {
-                        // RPC error, keep polling
-                    }
-                    Err(_) => {
-                        // Timed out, keep polling
-                    }
+                    Ok(Err(_)) => {}
+                    Err(_) => {}
                 }
             }
 
@@ -172,10 +212,20 @@ impl RpcFallback {
                 return Ok(sig);
             }
 
-            log::error!(
-                "[{}] {} RPC tx not confirmed after {}ms",
-                operation, label_upper, CONFIRM_POLLS * CONFIRM_INTERVAL.as_millis() as u32
+            log::warn!(
+                "[{}] {} RPC sent tx {} but not confirmed after {}ms — will try confirming on next endpoint",
+                operation, label_upper, sig, CONFIRM_POLLS * CONFIRM_INTERVAL.as_millis() as u32
             );
+        }
+
+        // If we sent a TX but never confirmed it, return the signature anyway.
+        // Oracle updates are idempotent; the TX is likely still propagating.
+        if let Some((sig, label)) = sent_sig {
+            log::warn!(
+                "[{}] TX {} (sent via {}) not confirmed by any endpoint — returning as best-effort",
+                operation, sig, label
+            );
+            return Ok(sig);
         }
 
         log::error!("[{}] All RPCs failed. Please handle ASAP. Critical Priority.", operation);

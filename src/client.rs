@@ -196,7 +196,7 @@ async fn main() -> anyhow::Result<()> {
     // ────────────────────────────────────────────────────────────────
     // Load pools config
     // ────────────────────────────────────────────────────────────────
-    let pools: Vec<Arc<PoolRuntime>> = load_pools_config(&args.pools_config)?
+    let mut pools: Vec<Arc<PoolRuntime>> = load_pools_config(&args.pools_config)?
         .into_iter()
         .map(Arc::new)
         .collect();
@@ -207,13 +207,27 @@ async fn main() -> anyhow::Result<()> {
             pool.name,
             pool.address,
             pool.required_providers,
-            pool.custody_accounts.len(),
+            pool.all_custody_accounts.len(),
             pool.cu_limit,
         );
     }
 
     let required_providers = aggregate_provider_requirements(&pools);
     log::info!("required providers across all pools: {:?}", required_providers);
+
+    // Validate custody order against on-chain state — quarantine invalid pools
+    let quarantined = pool_config::validate_custodies_against_chain(
+        &pools.iter().map(|p| p.as_ref()).collect::<Vec<_>>(),
+        rpc_fallback.primary_client(),
+    ).await;
+    if !quarantined.is_empty() {
+        log::warn!("⚠ {} pool(s) quarantined due to validation failure: {:?}", quarantined.len(), quarantined);
+        // Remove quarantined pools from the active set
+        pools.retain(|p| !quarantined.contains(&p.name));
+        if pools.is_empty() {
+            return Err(anyhow::anyhow!("All pools failed validation — cannot start"));
+        }
+    }
 
     // ────────────────────────────────────────────────────────────────
     // DB pool

@@ -99,7 +99,7 @@ pub async fn fire_update_pool_aum(
         multi_oracle_prices,
         switchboard_params,
         quote_account,
-        &pool.custody_accounts,
+        &pool.all_custody_accounts,
     )?;
 
     // Assemble full instruction sequence.

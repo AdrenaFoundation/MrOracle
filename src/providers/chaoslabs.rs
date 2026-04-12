@@ -88,19 +88,32 @@ pub fn make_chaoslabs_cycle(db_pool: DbPool) -> CycleFn {
     })
 }
 
-/// Convert a `Decimal` to a `u64`. The DB stores prices as NUMERIC without
-/// a scaling factor — adrena-data writes the already-scaled 1e10 integer
-/// directly as the decimal string. So we just need to check the value fits
-/// u64 and round any stray fractional part.
+/// Convert a `Decimal` to a `u64` with sanity bounds.
+/// Prices are at 1e10 scale (PRICE_DECIMALS=10).
+/// Rejects zero, negative, and prices outside a wide sanity window.
+///
+/// Bounds (at 1e10 scale):
+///   min: 1 (effectively $0.0000000001 — catches zero/corrupt)
+///   max: 10_000_000 * 1e10 = 1e17 (covers assets up to $10M per unit)
+const PRICE_SANITY_MIN: u64 = 1;
+const PRICE_SANITY_MAX: u64 = 100_000_000_000_000_000; // 1e17 = $10M at 1e10 scale
+
 fn decimal_to_u64(d: &rust_decimal::Decimal) -> anyhow::Result<u64> {
     if d.is_sign_negative() {
         return Err(anyhow!("negative price"));
     }
-    // Truncate to integer. adrena-data always stores already-scaled u64-compatible
-    // values so this never loses information in practice.
     let trunc = d.trunc();
     use rust_decimal::prelude::ToPrimitive;
-    trunc
+    let value = trunc
         .to_u64()
-        .ok_or_else(|| anyhow!("price {} does not fit u64", d))
+        .ok_or_else(|| anyhow!("price {} does not fit u64", d))?;
+
+    if value < PRICE_SANITY_MIN || value > PRICE_SANITY_MAX {
+        return Err(anyhow!(
+            "price {} outside sanity bounds [{}, {}]",
+            value, PRICE_SANITY_MIN, PRICE_SANITY_MAX
+        ));
+    }
+
+    Ok(value)
 }

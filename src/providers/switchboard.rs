@@ -141,13 +141,10 @@ struct SidecarOutput {
     quote_store_ix: SidecarInstruction,
     quote_account: String, // base58 Pubkey
     quote_slot: u64,
-    // Ignored — we always send instruction_idx=2 in the on-chain tx (matches
-    // the adrena-data sidecar default and the position of ed25519_ix after
-    // the two compute-budget ixs). Kept for forward-compat if ops ever needs
-    // to override the tx layout.
+    // Expected to be 2 (ed25519_ix position after the two compute-budget ixs).
+    // We assert this at parse time rather than silently ignoring it.
     #[serde(default, rename = "instruction_idx")]
-    #[allow(dead_code)]
-    _instruction_idx: Option<u32>,
+    pub instruction_idx: Option<u32>,
 }
 
 fn deserialize_instruction(raw: SidecarInstruction) -> anyhow::Result<Instruction> {
@@ -209,6 +206,19 @@ pub fn make_switchboard_cycle(db_pool: DbPool, config: SwitchboardRuntimeConfig)
                     batch.oracle_batch_id
                 )
             })?;
+
+            // Assert instruction_idx matches our hardcoded tx layout (ed25519 at position 2,
+            // after compute-budget price + limit). If the sidecar ever changes this, we must
+            // update the tx assembly in handlers/update_pool_aum.rs.
+            if let Some(idx) = sidecar.instruction_idx {
+                if idx != 2 {
+                    anyhow::bail!(
+                        "switchboard sidecar instruction_idx={} but expected 2 — \
+                         tx layout assumption violated, update handlers/update_pool_aum.rs",
+                        idx
+                    );
+                }
+            }
 
             let ed25519_ix = deserialize_instruction(sidecar.ed25519_ix)
                 .context("decode switchboard ed25519_ix")?;
