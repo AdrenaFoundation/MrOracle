@@ -33,12 +33,16 @@ use {
 pub const COLLECTION_WINDOW: Duration = Duration::from_secs(5);
 
 /// Default compute unit limit for an `update_pool_aum` tx carrying only
-/// ChaosLabs/Autonom batches (no Switchboard). Matches main's UPDATE_AUM_CU_LIMIT.
-pub const DEFAULT_CU_LIMIT: u32 = 200_000;
+/// ChaosLabs/Autonom batches (no Switchboard).
+/// Based on release/39-postaudit distribute_fees ref max (224,922 CU, similar
+/// AUM calc) × 1.20 = 270k. For Autonom pools with 32 synthetic custodies this
+/// may need to be higher — verify with `instructions_cu_size_log.txt`.
+pub const DEFAULT_CU_LIMIT: u32 = 270_000;
 
 /// Default compute unit limit when the tx also carries the ed25519 + quote
-/// store instructions for Switchboard. These precompiles are CU-heavy.
-pub const DEFAULT_CU_LIMIT_WITH_SWITCHBOARD: u32 = 1_400_000;
+/// store instructions for Switchboard. These precompiles are CU-heavy
+/// (~1.2M for ed25519). 270k AUM + 1.2M Switchboard precompile + buffer.
+pub const DEFAULT_CU_LIMIT_WITH_SWITCHBOARD: u32 = 1_500_000;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Operator config file schema
