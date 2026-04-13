@@ -14,13 +14,17 @@ use {
         oracle_poller::{CycleFn, PollerPayload},
         provider_updates::ProviderUpdate,
     },
+    adrena_abi::feed_ids::AUTONOM_RANGE,
     anyhow::{anyhow, Context},
     deadpool_postgres::Pool as DbPool,
 };
 
 const AUTONOM_PROVIDER: &str = "autonom";
-const AUTONOM_MIN_FEED_ID: i32 = 30;
-const AUTONOM_MAX_FEED_ID: i32 = 141;
+// Range bounds widened to i32 for DB column compatibility (oracle_batch_prices.feed_id is i32).
+// Source of truth lives in adrena_abi::feed_ids::AUTONOM_RANGE — see also
+// `OracleProvider::Autonom.feed_id_range()` in adrena-abi/src/oracle.rs.
+const AUTONOM_MIN_FEED_ID: i32 = AUTONOM_RANGE.0 as i32;
+const AUTONOM_MAX_FEED_ID: i32 = AUTONOM_RANGE.1 as i32;
 
 /// Default TTL for forwarded oracle batches (seconds). Override with
 /// `ORACLE_BATCH_MAX_AGE_SECONDS`. Timestamp-based safety rule: reject any

@@ -24,10 +24,15 @@ use {
         oracle_poller::{CycleFn, PollerPayload},
         provider_updates::{ProviderUpdate, SwitchboardOraclePricesUpdate},
     },
+    adrena_abi::{
+        feed_ids::SWITCHBOARD_RANGE,
+        feed_maps::{SWITCHBOARD_DEVNET_JSON, SWITCHBOARD_MAINNET_JSON},
+    },
     anyhow::{anyhow, Context},
     base64::{engine::general_purpose::STANDARD as BASE64, Engine},
     deadpool_postgres::Pool as DbPool,
     serde::Deserialize,
+    sha2::{Digest, Sha256},
     solana_sdk::{
         instruction::{AccountMeta, Instruction},
         pubkey::Pubkey,
@@ -36,11 +41,58 @@ use {
 };
 
 const SWITCHBOARD_PROVIDER: &str = "switchboard";
-const SWITCHBOARD_MIN_FEED_ID: u8 = 142;
-const SWITCHBOARD_MAX_FEED_ID: u8 = 255;
+// Source of truth lives in adrena_abi::feed_ids::SWITCHBOARD_RANGE — see also
+// `OracleProvider::Switchboard.feed_id_range()` in adrena-abi/src/oracle.rs.
+const SWITCHBOARD_MIN_FEED_ID: u8 = SWITCHBOARD_RANGE.0;
+const SWITCHBOARD_MAX_FEED_ID: u8 = SWITCHBOARD_RANGE.1;
+
+/// Cluster selector for the embedded Switchboard feed map. Defaults to mainnet
+/// when no explicit override is provided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwitchboardCluster {
+    Mainnet,
+    Devnet,
+}
+
+impl SwitchboardCluster {
+    pub fn embedded_json(&self) -> &'static str {
+        match self {
+            SwitchboardCluster::Mainnet => SWITCHBOARD_MAINNET_JSON,
+            SwitchboardCluster::Devnet => SWITCHBOARD_DEVNET_JSON,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            SwitchboardCluster::Mainnet => "mainnet",
+            SwitchboardCluster::Devnet => "devnet",
+        }
+    }
+}
+
+impl FromStr for SwitchboardCluster {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "mainnet" | "main" => Ok(SwitchboardCluster::Mainnet),
+            "devnet" | "dev" => Ok(SwitchboardCluster::Devnet),
+            other => Err(anyhow!("invalid switchboard cluster `{other}` (expected mainnet|devnet)")),
+        }
+    }
+}
+
+fn sha256_hex(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    hex::encode(hasher.finalize())
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Local feed-map JSON (mirrors adrena-data's switchboard_feed_map.json)
+// Switchboard feed map runtime config + JSON parser. Default source is the
+// embedded adrena-abi central map (see `load_switchboard_feed_map_embedded`
+// below); operator may supply an override file via --switchboard-feed-map-path
+// (handled by `load_switchboard_feed_map`). Both routes parse the same JSON
+// shape via `parse_feed_map`.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -61,8 +113,45 @@ struct SwitchboardFeedMapFile {
 struct SwitchboardFeedMapRaw {
     adrena_feed_id: u8,
     switchboard_feed_hash: String,
+    /// Set to true in the central adrena-abi map for placeholder feed hashes
+    /// (currently slots 143/144 = jitoSOL/BTC). Active feeds with `_DUMMY: true`
+    /// are rejected at startup so production cannot accidentally publish a
+    /// fake price.
+    #[serde(default, rename = "_DUMMY")]
+    dummy: bool,
 }
 
+/// Load the central adrena-abi switchboard feed map for the given cluster. Use
+/// this when no `--switchboard-feed-map-path` override is supplied.
+///
+/// Dummy slots (`_DUMMY: true`) in the central map are **automatically skipped
+/// with a warning log per slot**. To activate a slot that's currently marked
+/// dummy, the operator must either (a) push a non-dummy version of the central
+/// map to adrena-abi (which also requires updating
+/// `tests/no_dummy_in_production.rs` ALLOWED_DUMMY_FEED_IDS), or (b) supply a
+/// real-hash override file via `--switchboard-feed-map-path`.
+pub fn load_switchboard_feed_map_embedded(
+    cluster: SwitchboardCluster,
+    queue_pubkey: Pubkey,
+    max_age_slots: u64,
+) -> anyhow::Result<SwitchboardRuntimeConfig> {
+    let json = cluster.embedded_json();
+    log::info!(
+        "switchboard: loading embedded {} feed map from adrena-abi (sha256={})",
+        cluster.label(),
+        sha256_hex(json),
+    );
+    parse_feed_map(json, queue_pubkey, max_age_slots, /*skip_dummy=*/ true)
+        .with_context(|| format!("parse embedded switchboard {} feed map", cluster.label()))
+}
+
+/// Load a switchboard feed map from a local file path. Logs the path and the
+/// sha256 of the file contents so override drift is visible in service logs.
+///
+/// **Override files MUST NOT contain `_DUMMY: true` entries** — operator-
+/// supplied files are expected to be production-grade. Any dummy slot in an
+/// override file is treated as a hard error at startup (you don't choose a
+/// custom file just to ship placeholder hashes).
 pub fn load_switchboard_feed_map(
     feed_map_path: &str,
     queue_pubkey: Pubkey,
@@ -70,24 +159,74 @@ pub fn load_switchboard_feed_map(
 ) -> anyhow::Result<SwitchboardRuntimeConfig> {
     let raw = fs::read_to_string(feed_map_path)
         .with_context(|| format!("read switchboard feed map at `{feed_map_path}`"))?;
+    log::warn!(
+        "switchboard: using OVERRIDE feed map path `{feed_map_path}` (sha256={}) — not the pinned adrena-abi artifact",
+        sha256_hex(&raw),
+    );
+    parse_feed_map(&raw, queue_pubkey, max_age_slots, /*skip_dummy=*/ false)
+        .with_context(|| format!("parse switchboard feed map at `{feed_map_path}`"))
+}
 
+/// Internal: parse a feed-map JSON string and validate every entry.
+///
+/// If `skip_dummy` is true (embedded mode), entries with `_DUMMY: true` are
+/// dropped with a warning log per slot. If false (override mode), dummies
+/// are a hard error.
+///
+/// Other hard errors (any of these abort startup):
+///   * empty feed map (after dummy filtering, if applicable)
+///   * adrena_feed_id outside the Switchboard 142..=255 range
+///   * malformed switchboard_feed_hash (non-hex, wrong length)
+///   * duplicate adrena_feed_id
+fn parse_feed_map(
+    raw: &str,
+    queue_pubkey: Pubkey,
+    max_age_slots: u64,
+    skip_dummy: bool,
+) -> anyhow::Result<SwitchboardRuntimeConfig> {
     // Support both the bare array form (legacy) and the wrapped form with
     // `_schema_version` + `switchboard_feed_map`.
-    let entries: Vec<SwitchboardFeedMapRaw> = match serde_json::from_str::<SwitchboardFeedMapFile>(&raw) {
+    let entries: Vec<SwitchboardFeedMapRaw> = match serde_json::from_str::<SwitchboardFeedMapFile>(raw) {
         Ok(parsed) => parsed.switchboard_feed_map,
-        Err(_) => serde_json::from_str(&raw)
-            .with_context(|| format!("parse switchboard feed map at `{feed_map_path}`"))?,
+        Err(_) => serde_json::from_str(raw).context("parse switchboard feed map JSON")?,
     };
 
     if entries.is_empty() {
-        return Err(anyhow!("switchboard feed map at `{feed_map_path}` is empty"));
+        return Err(anyhow!("switchboard feed map is empty"));
     }
 
     let mut feed_map = Vec::with_capacity(entries.len());
+    let mut seen = std::collections::HashSet::new();
     for entry in entries {
         if !(SWITCHBOARD_MIN_FEED_ID..=SWITCHBOARD_MAX_FEED_ID).contains(&entry.adrena_feed_id) {
             return Err(anyhow!(
                 "switchboard adrena_feed_id {} outside range {SWITCHBOARD_MIN_FEED_ID}..={SWITCHBOARD_MAX_FEED_ID}",
+                entry.adrena_feed_id
+            ));
+        }
+
+        if entry.dummy {
+            if skip_dummy {
+                log::warn!(
+                    "switchboard adrena_feed_id {} is marked _DUMMY: true in the central map — skipping. \
+                     This slot is NOT being submitted to chain. To activate, supply a real-hash override \
+                     via --switchboard-feed-map-path or unmark in adrena-abi.",
+                    entry.adrena_feed_id
+                );
+                continue;
+            } else {
+                return Err(anyhow!(
+                    "switchboard adrena_feed_id {} is marked _DUMMY: true in the override file. \
+                     Override files must contain real production hashes — remove the _DUMMY flag or use \
+                     a different file.",
+                    entry.adrena_feed_id
+                ));
+            }
+        }
+
+        if !seen.insert(entry.adrena_feed_id) {
+            return Err(anyhow!(
+                "duplicate switchboard adrena_feed_id {}",
                 entry.adrena_feed_id
             ));
         }
@@ -108,6 +247,12 @@ pub fn load_switchboard_feed_map(
             adrena_feed_id: entry.adrena_feed_id,
             switchboard_feed_hash: hash,
         });
+    }
+
+    if feed_map.is_empty() {
+        return Err(anyhow!(
+            "switchboard feed map is empty after dummy filtering — every entry was marked _DUMMY: true",
+        ));
     }
 
     Ok(SwitchboardRuntimeConfig {

@@ -151,9 +151,18 @@ struct Args {
     #[clap(long, default_value_t = DEFAULT_SWITCHBOARD_POLL_MS)]
     switchboard_poll_ms: u64,
 
-    /// Switchboard feed map JSON path (required if any pool uses switchboard)
+    /// Switchboard feed map JSON path. If omitted, the embedded adrena-abi
+    /// central map is used (selected by --cluster). Override only when running
+    /// against a non-canonical map; the override path + sha256 are logged loudly
+    /// so drift is visible.
     #[clap(long)]
     switchboard_feed_map_path: Option<String>,
+
+    /// Cluster used to select the embedded Switchboard feed map from adrena-abi
+    /// when no --switchboard-feed-map-path override is supplied. Ignored if an
+    /// override path is set.
+    #[clap(long, default_value = "mainnet")]
+    switchboard_cluster: String,
 
     /// Switchboard queue pubkey (mainnet default if omitted)
     #[clap(long, default_value_t = String::from(DEFAULT_SWITCHBOARD_MAINNET_QUEUE))]
@@ -298,20 +307,30 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if required_providers.contains(&ProviderKind::Switchboard) {
-        let feed_map_path = args
-            .switchboard_feed_map_path
-            .as_deref()
-            .ok_or_else(|| {
-                anyhow::anyhow!("--switchboard-feed-map-path is required when any pool uses switchboard")
-            })?;
         let queue_pubkey = Pubkey::from_str(&args.switchboard_queue_pubkey).map_err(|e| {
             anyhow::anyhow!("invalid --switchboard-queue-pubkey: {e}")
         })?;
-        let sb_config = providers::switchboard::load_switchboard_feed_map(
-            feed_map_path,
-            queue_pubkey,
-            args.switchboard_max_age_slots,
-        )?;
+
+        let sb_config = if let Some(override_path) = args.switchboard_feed_map_path.as_deref() {
+            // Operator-supplied override file. Dummies in the override are a
+            // hard error (you don't pick a custom file just to ship placeholders).
+            providers::switchboard::load_switchboard_feed_map(
+                override_path,
+                queue_pubkey,
+                args.switchboard_max_age_slots,
+            )?
+        } else {
+            // Default: load the embedded central adrena-abi map for the chosen
+            // cluster. Dummy slots in the central map are auto-skipped with a
+            // warning log per slot (see load_switchboard_feed_map_embedded).
+            let cluster: providers::switchboard::SwitchboardCluster =
+                args.switchboard_cluster.parse()?;
+            providers::switchboard::load_switchboard_feed_map_embedded(
+                cluster,
+                queue_pubkey,
+                args.switchboard_max_age_slots,
+            )?
+        };
         log::info!(
             "switchboard: queue={} feeds={} max_age_slots={}",
             sb_config.queue_pubkey,

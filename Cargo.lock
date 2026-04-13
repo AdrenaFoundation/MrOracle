@@ -69,7 +69,7 @@ checksum = "512761e0bb2578dd7380c6baaa0f4ce03e84f95e960231d1dec8bf4d7d6e2627"
 [[package]]
 name = "adrena-abi"
 version = "1.3.1"
-source = "git+https://github.com/AdrenaFoundation/adrena-abi.git?rev=1e05092e08980ce0ed3183d52aa5049ea51168ed#1e05092e08980ce0ed3183d52aa5049ea51168ed"
+source = "git+https://github.com/AdrenaFoundation/adrena-abi.git?rev=e8cff27ca0f7a6ed2beb7dcc30dfe6822756b11b#e8cff27ca0f7a6ed2beb7dcc30dfe6822756b11b"
 dependencies = [
  "anchor-client",
  "anchor-lang",

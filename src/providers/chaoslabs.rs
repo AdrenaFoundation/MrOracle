@@ -15,13 +15,17 @@ use {
         oracle_poller::{CycleFn, PollerPayload},
         provider_updates::ProviderUpdate,
     },
+    adrena_abi::feed_ids::CHAOSLABS_RANGE,
     anyhow::{anyhow, Context},
     deadpool_postgres::Pool as DbPool,
 };
 
 const CHAOSLABS_PROVIDER: &str = "chaoslabs";
-const CHAOSLABS_MIN_FEED_ID: i32 = 0;
-const CHAOSLABS_MAX_FEED_ID: i32 = 29;
+// Range bounds widened to i32 for DB column compatibility (oracle_batch_prices.feed_id is i32).
+// Source of truth lives in adrena_abi::feed_ids::CHAOSLABS_RANGE — see also
+// `OracleProvider::ChaosLabs.feed_id_range()` in adrena-abi/src/oracle.rs.
+const CHAOSLABS_MIN_FEED_ID: i32 = CHAOSLABS_RANGE.0 as i32;
+const CHAOSLABS_MAX_FEED_ID: i32 = CHAOSLABS_RANGE.1 as i32;
 
 /// Default TTL for forwarded oracle batches (seconds). Override with
 /// `ORACLE_BATCH_MAX_AGE_SECONDS`. Timestamp-based safety rule: reject any
