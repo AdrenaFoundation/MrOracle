@@ -22,6 +22,20 @@ const AUTONOM_PROVIDER: &str = "autonom";
 const AUTONOM_MIN_FEED_ID: i32 = 30;
 const AUTONOM_MAX_FEED_ID: i32 = 141;
 
+/// Default TTL for forwarded oracle batches (seconds). Override with
+/// `ORACLE_BATCH_MAX_AGE_SECONDS`. Timestamp-based safety rule: reject any
+/// batch whose latest_timestamp or per-price timestamp is older than this.
+/// Independent of adrena-data ingestion-side TTL.
+///
+/// Note: Autonom uses fresh=false fallback for missing feeds; do NOT reject
+/// based on metadata.used_fallback. Only timestamps decide staleness.
+fn oracle_batch_max_age_seconds() -> i64 {
+    std::env::var("ORACLE_BATCH_MAX_AGE_SECONDS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(30)
+}
+
 pub fn make_autonom_cycle(db_pool: DbPool) -> CycleFn {
     Box::new(move || {
         let db_pool = db_pool.clone();
@@ -39,6 +53,31 @@ pub fn make_autonom_cycle(db_pool: DbPool) -> CycleFn {
                     "autonom oracle_batch {} has zero prices",
                     batch.oracle_batch_id
                 ));
+            }
+
+            // Timestamp TTL check (independent of adrena-data). Reject stale
+            // batches before building a ProviderUpdate. Timestamp-based safety
+            // rule: ignore fresh/used_fallback metadata, decide only on actual
+            // price timestamps.
+            let ttl = oracle_batch_max_age_seconds();
+            let now = chrono::Utc::now();
+            let batch_age = (now - batch.latest_timestamp).num_seconds();
+            if batch_age > ttl {
+                log::warn!(
+                    "autonom oracle_batch {} stale: latest_timestamp age={}s > ttl={}s — skipping cycle",
+                    batch.oracle_batch_id, batch_age, ttl
+                );
+                return Ok(None);
+            }
+            for p in &batch.prices {
+                let p_age = (now - p.price_timestamp).num_seconds();
+                if p_age > ttl {
+                    log::warn!(
+                        "autonom oracle_batch {} stale: feed_id={} price_timestamp age={}s > ttl={}s — skipping cycle",
+                        batch.oracle_batch_id, p.feed_id, p_age, ttl
+                    );
+                    return Ok(None);
+                }
             }
 
             let (signature, recovery_id) = batch.decode_signature()?;

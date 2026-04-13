@@ -23,6 +23,18 @@ const CHAOSLABS_PROVIDER: &str = "chaoslabs";
 const CHAOSLABS_MIN_FEED_ID: i32 = 0;
 const CHAOSLABS_MAX_FEED_ID: i32 = 29;
 
+/// Default TTL for forwarded oracle batches (seconds). Override with
+/// `ORACLE_BATCH_MAX_AGE_SECONDS`. Timestamp-based safety rule: reject any
+/// batch whose latest_timestamp or per-price timestamp is older than this.
+/// Independent of adrena-data's ingestion-side TTL — we do not rely on
+/// upstream filtering.
+fn oracle_batch_max_age_seconds() -> i64 {
+    std::env::var("ORACLE_BATCH_MAX_AGE_SECONDS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(30)
+}
+
 pub fn make_chaoslabs_cycle(db_pool: DbPool) -> CycleFn {
     Box::new(move || {
         let db_pool = db_pool.clone();
@@ -40,6 +52,30 @@ pub fn make_chaoslabs_cycle(db_pool: DbPool) -> CycleFn {
                     "chaoslabs oracle_batch {} has zero prices",
                     batch.oracle_batch_id
                 ));
+            }
+
+            // Timestamp TTL check (independent of adrena-data). Reject stale
+            // batches before building a ProviderUpdate so we don't dispatch
+            // old signed data to the chain.
+            let ttl = oracle_batch_max_age_seconds();
+            let now = chrono::Utc::now();
+            let batch_age = (now - batch.latest_timestamp).num_seconds();
+            if batch_age > ttl {
+                log::warn!(
+                    "chaoslabs oracle_batch {} stale: latest_timestamp age={}s > ttl={}s — skipping cycle",
+                    batch.oracle_batch_id, batch_age, ttl
+                );
+                return Ok(None);
+            }
+            for p in &batch.prices {
+                let p_age = (now - p.price_timestamp).num_seconds();
+                if p_age > ttl {
+                    log::warn!(
+                        "chaoslabs oracle_batch {} stale: feed_id={} price_timestamp age={}s > ttl={}s — skipping cycle",
+                        batch.oracle_batch_id, p.feed_id, p_age, ttl
+                    );
+                    return Ok(None);
+                }
             }
 
             let (signature, recovery_id) = batch.decode_signature()?;
