@@ -29,11 +29,23 @@ const AUTONOM_MAX_FEED_ID: i32 = 141;
 ///
 /// Note: Autonom uses fresh=false fallback for missing feeds; do NOT reject
 /// based on metadata.used_fallback. Only timestamps decide staleness.
+///
+/// Default 5s sits below adrena on-chain STALENESS=7s (oracle.rs:33), leaving
+/// ~2s for tx propagation + confirm. Anything looser allows MrOracle to
+/// forward batches that adrena on-chain will reject as stale.
 fn oracle_batch_max_age_seconds() -> i64 {
     std::env::var("ORACLE_BATCH_MAX_AGE_SECONDS")
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(30)
+        .unwrap_or(5)
+}
+
+/// Maximum allowed clock drift (seconds) for future-dated batches.
+fn oracle_batch_future_drift_seconds() -> i64 {
+    std::env::var("ORACLE_BATCH_FUTURE_DRIFT_SECONDS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(2)
 }
 
 pub fn make_autonom_cycle(db_pool: DbPool) -> CycleFn {
@@ -60,6 +72,7 @@ pub fn make_autonom_cycle(db_pool: DbPool) -> CycleFn {
             // rule: ignore fresh/used_fallback metadata, decide only on actual
             // price timestamps.
             let ttl = oracle_batch_max_age_seconds();
+            let drift = oracle_batch_future_drift_seconds();
             let now = chrono::Utc::now();
             let batch_age = (now - batch.latest_timestamp).num_seconds();
             if batch_age > ttl {
@@ -69,12 +82,26 @@ pub fn make_autonom_cycle(db_pool: DbPool) -> CycleFn {
                 );
                 return Ok(None);
             }
+            if batch_age < -drift {
+                log::warn!(
+                    "autonom oracle_batch {} future-dated: latest_timestamp age={}s (drift > {}s) — skipping cycle",
+                    batch.oracle_batch_id, batch_age, drift
+                );
+                return Ok(None);
+            }
             for p in &batch.prices {
                 let p_age = (now - p.price_timestamp).num_seconds();
                 if p_age > ttl {
                     log::warn!(
                         "autonom oracle_batch {} stale: feed_id={} price_timestamp age={}s > ttl={}s — skipping cycle",
                         batch.oracle_batch_id, p.feed_id, p_age, ttl
+                    );
+                    return Ok(None);
+                }
+                if p_age < -drift {
+                    log::warn!(
+                        "autonom oracle_batch {} future-dated: feed_id={} price_timestamp age={}s (drift > {}s) — skipping cycle",
+                        batch.oracle_batch_id, p.feed_id, p_age, drift
                     );
                     return Ok(None);
                 }

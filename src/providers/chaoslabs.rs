@@ -28,11 +28,26 @@ const CHAOSLABS_MAX_FEED_ID: i32 = 29;
 /// batch whose latest_timestamp or per-price timestamp is older than this.
 /// Independent of adrena-data's ingestion-side TTL — we do not rely on
 /// upstream filtering.
+///
+/// Default 5s sits below adrena on-chain STALENESS=7s (oracle.rs:33), leaving
+/// ~2s for tx propagation + confirm. Anything looser allows MrOracle to
+/// forward batches that adrena on-chain will reject as stale.
 fn oracle_batch_max_age_seconds() -> i64 {
     std::env::var("ORACLE_BATCH_MAX_AGE_SECONDS")
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(30)
+        .unwrap_or(5)
+}
+
+/// Maximum allowed clock drift (seconds) for future-dated batches. Overrides
+/// `ORACLE_BATCH_FUTURE_DRIFT_SECONDS`. adrena on-chain clamps future-dated
+/// price timestamps to current_time (H3 fix) but rejecting up-front surfaces
+/// clock drift loudly instead of silently producing weird audit trails.
+fn oracle_batch_future_drift_seconds() -> i64 {
+    std::env::var("ORACLE_BATCH_FUTURE_DRIFT_SECONDS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(2)
 }
 
 pub fn make_chaoslabs_cycle(db_pool: DbPool) -> CycleFn {
@@ -58,6 +73,7 @@ pub fn make_chaoslabs_cycle(db_pool: DbPool) -> CycleFn {
             // batches before building a ProviderUpdate so we don't dispatch
             // old signed data to the chain.
             let ttl = oracle_batch_max_age_seconds();
+            let drift = oracle_batch_future_drift_seconds();
             let now = chrono::Utc::now();
             let batch_age = (now - batch.latest_timestamp).num_seconds();
             if batch_age > ttl {
@@ -67,12 +83,26 @@ pub fn make_chaoslabs_cycle(db_pool: DbPool) -> CycleFn {
                 );
                 return Ok(None);
             }
+            if batch_age < -drift {
+                log::warn!(
+                    "chaoslabs oracle_batch {} future-dated: latest_timestamp age={}s (drift > {}s) — skipping cycle",
+                    batch.oracle_batch_id, batch_age, drift
+                );
+                return Ok(None);
+            }
             for p in &batch.prices {
                 let p_age = (now - p.price_timestamp).num_seconds();
                 if p_age > ttl {
                     log::warn!(
                         "chaoslabs oracle_batch {} stale: feed_id={} price_timestamp age={}s > ttl={}s — skipping cycle",
                         batch.oracle_batch_id, p.feed_id, p_age, ttl
+                    );
+                    return Ok(None);
+                }
+                if p_age < -drift {
+                    log::warn!(
+                        "chaoslabs oracle_batch {} future-dated: feed_id={} price_timestamp age={}s (drift > {}s) — skipping cycle",
+                        batch.oracle_batch_id, p.feed_id, p_age, drift
                     );
                     return Ok(None);
                 }
