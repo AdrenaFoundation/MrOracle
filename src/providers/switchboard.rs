@@ -355,12 +355,25 @@ pub fn make_switchboard_cycle(db_pool: DbPool, config: SwitchboardRuntimeConfig)
             // Assert instruction_idx matches our hardcoded tx layout (ed25519 at position 2,
             // after compute-budget price + limit). If the sidecar ever changes this, we must
             // update the tx assembly in handlers/update_pool_aum.rs.
-            if let Some(idx) = sidecar.instruction_idx {
-                if idx != 2 {
+            match sidecar.instruction_idx {
+                Some(2) => {}
+                Some(idx) => {
                     anyhow::bail!(
                         "switchboard sidecar instruction_idx={} but expected 2 — \
                          tx layout assumption violated, update handlers/update_pool_aum.rs",
                         idx
+                    );
+                }
+                None => {
+                    // Not fatal today (field is optional for back-compat), but if it ever
+                    // disappears from the producer side we lose the only cross-boundary
+                    // check on ed25519 placement. Surface loudly so future layout drift
+                    // doesn't hide behind silent acceptance.
+                    log::warn!(
+                        "switchboard sidecar for batch {} omits instruction_idx — cannot \
+                         validate ed25519 tx position. Check adrena-data sidecar writer; \
+                         if layout changed, update handlers/update_pool_aum.rs.",
+                        batch.oracle_batch_id,
                     );
                 }
             }

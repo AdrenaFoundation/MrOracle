@@ -85,6 +85,17 @@ pub async fn get_mean_prioritization_fee_by_percentile(
     fees.sort_unstable();
 
     let percentile_bps = config.percentile.unwrap_or(5000);
-    let idx = ((fees.len() as u64).saturating_sub(1) * percentile_bps / 10_000) as usize;
-    Ok(fees[idx.min(fees.len() - 1)])
+    // Linear-interpolated percentile (PERCENTILE.INC semantics). The old
+    // integer-division form truncated to fees[0] on small samples — e.g.
+    // n=2, p=2500 → 1 * 2500 / 10_000 = 0, returning the minimum fee
+    // regardless of congestion. Floats let the rank carry fractional weight
+    // between adjacent samples so startup / degraded-RPC windows don't stall
+    // under-priced.
+    let n = fees.len();
+    let rank = n.saturating_sub(1) as f64 * percentile_bps as f64 / 10_000.0;
+    let lo = rank.floor() as usize;
+    let hi = (lo + 1).min(n - 1);
+    let frac = rank - lo as f64;
+    let fee = fees[lo] as f64 * (1.0 - frac) + fees[hi] as f64 * frac;
+    Ok(fee.round() as u64)
 }

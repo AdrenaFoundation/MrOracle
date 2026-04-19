@@ -286,11 +286,28 @@ pub async fn validate_custodies_against_chain(
     pools: &[&PoolRuntime],
     rpc_client: &solana_client::nonblocking::rpc_client::RpcClient,
 ) -> HashSet<String> {
+    // Pool account total size on release/39: disc(8) + struct(2528) = 2536.
+    // See the layout tests at the bottom of this file. If on-chain data.len()
+    // diverges, the Pool struct shape likely changed upstream — validation may
+    // still succeed against drifted memory, so we surface this as a loud WARN
+    // alongside any downstream quarantine for fast root-cause.
+    const EXPECTED_POOL_ACCOUNT_SIZE: usize = 2536;
+
     let mut quarantined: HashSet<String> = HashSet::new();
 
     for pool in pools {
         match rpc_client.get_account_data(&pool.address).await {
             Ok(data) => {
+                if data.len() != EXPECTED_POOL_ACCOUNT_SIZE {
+                    log::warn!(
+                        "⚠️ [{}] pool account is {} bytes, expected {} (release/39 Pool struct). \
+                         If adrena program shipped a new release, update the offset constants + \
+                         layout tests in src/pool_config.rs against adrena-abi/src/types.rs Pool.",
+                        pool.name,
+                        data.len(),
+                        EXPECTED_POOL_ACCOUNT_SIZE,
+                    );
+                }
                 // Pool struct layout (repr(C)):
                 //   disc(8) + 8*u8(8) + LimitedString(32) = custodies at offset 48
                 //   custodies: [Pubkey;8] at offset 48 (256 bytes)
