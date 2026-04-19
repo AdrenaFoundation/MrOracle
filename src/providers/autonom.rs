@@ -139,6 +139,14 @@ pub fn make_autonom_cycle(db_pool: DbPool) -> CycleFn {
                 });
             }
 
+            // Adrena on-chain `build_message_hash` iterates prices in-place without
+            // sorting, so the signature only verifies if we emit in the same order
+            // Autonom signed (feed_id ascending). Today this holds via three-layer
+            // convention (Autonom sorts → adrena-data inserts in order → DB returns
+            // by oracle_batch_price_id ASC). Sort here so that contract survives
+            // any future refactor of the intermediate layers.
+            prices.sort_by_key(|p| p.feed_id);
+
             let batch_prices = BatchPrices {
                 prices,
                 signature,
